@@ -191,15 +191,16 @@ def tick_mario(x0, x1):
     ticks_since_cam_change = tick_count - last_cam_change_tick
     is_cam_change_ok = ticks_since_cam_change > 8
 
-    if is_cam_change_ok and camLookX != 0:  # Dead zone handled in inputs
-        rot_angle = math.radians(360.0 * camLookX)
-        rotation = mathutils.Quaternion((0, 0, 1), rot_angle)
-        r3d.view_rotation = rotation @ r3d.view_rotation
-        last_cam_change_tick = tick_count
-    elif is_cam_change_ok and camLookZ != 0:
-        zoom_factor = 1.0 + camLookZ
-        r3d.view_distance *= zoom_factor
-        last_cam_change_tick = tick_count
+    if is_cam_change_ok:
+        if camLookX != 0:  # Dead zone handled in inputs
+            rot_angle = math.radians(360.0 * camLookX)
+            rotation = mathutils.Quaternion((0, 0, 1), rot_angle)
+            r3d.view_rotation = rotation @ r3d.view_rotation
+            last_cam_change_tick = tick_count
+        elif camLookZ != 0:
+            zoom_factor = 1.0 + camLookZ
+            r3d.view_distance *= zoom_factor
+            last_cam_change_tick = tick_count
 
     look_dir = r3d.view_rotation @ mathutils.Vector((0.0, 0.0, -1.0))
     mario_inputs.camLookX = look_dir.x

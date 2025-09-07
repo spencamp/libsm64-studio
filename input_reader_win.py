@@ -28,6 +28,8 @@ def sample_input_reader(mario_inputs):
     if config['keyboard_control']:
         mario_inputs.stickX = input_value['RIGHT']*1 - input_value['LEFT']*1
         mario_inputs.stickY = input_value['DOWN']*1 - input_value['UP']*1
+        mario_inputs.camLookX = 0.0
+        mario_inputs.camLookZ = 0.0
         mario_inputs.buttonA = input_value['A']
         mario_inputs.buttonB = input_value['B']
         mario_inputs.buttonZ = input_value['C']
@@ -48,9 +50,15 @@ def sample_input_reader(mario_inputs):
         mario_inputs.buttonB = vals[3] != 0
         mario_inputs.buttonZ = vals[4] != 0
 
+        # TODO?
+        mario_inputs.camLookX = 0.0
+        mario_inputs.camLookZ = 0.0
+
 def _sample_empty_inputs(mario_inputs):
     mario_inputs.stickX = 0.0
     mario_inputs.stickY = 0.0
+    mario_inputs.camLookX = 0.0
+    mario_inputs.camLookZ = 0.0
     mario_inputs.buttonA = False
     mario_inputs.buttonB = False
     mario_inputs.buttonZ = False
