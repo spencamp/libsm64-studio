@@ -31,11 +31,12 @@ JOYSTICK_TRESHOLD = 0.3
 
 def sample_input_reader(mario_inputs):
     from . import config, input_value
-    mario_inputs.camLookX = 0;
-    mario_inputs.camLookZ = 0;
+
     if config['keyboard_control']:
         mario_inputs.stickX = input_value['RIGHT']*1 - input_value['LEFT']*1
         mario_inputs.stickY = input_value['DOWN']*1 - input_value['UP']*1
+        mario_inputs.camLookX = 0.0
+        mario_inputs.camLookZ = 0.0
         mario_inputs.buttonA = input_value['A']
         mario_inputs.buttonB = input_value['B']
         mario_inputs.buttonZ = input_value['C']
