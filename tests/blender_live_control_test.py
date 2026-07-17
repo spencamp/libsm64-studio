@@ -91,12 +91,16 @@ assert timer() == mario.SIMULATION_INTERVAL
 assert len(first.sm64_mario_tick.calls) == ticks_before + 1
 assert not recorder.active and recorder.sample_count == 0
 
-# A take starts from the rehearsed public state and captures only later ticks.
+# A persistent mark is deliberate; recording captures only later ticks and does
+# not replace it.
 mario.mario_state.posX = 123.25
 mario.mario_state.posY = 456.5
 mario.mario_state.posZ = -78.75
-mark = mario.begin_mario_recording(scene)
+mark = mario.set_persistent_start_mark()
 assert mark["position"] == (123.25, 456.5, -78.75)
+mario.mario_state.posX = 321.0
+mario.begin_mario_recording(scene)
+assert mario._valid_persistent_start_mark()["position"] == (123.25, 456.5, -78.75)
 assert recorder.start_frame == 41.0
 assert math.isclose(
     recorder.target_fps,
@@ -110,27 +114,28 @@ assert recorder.sample_count == 1
 samples = mario.freeze_mario_recording_for_bake()
 assert len(samples) == 1 and mario.live_control_status() == mario.BAKING
 recorder.complete("Take 001")
-mario.resume_live_idle_after_transition(mark)
+mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
-assert session.timer_callback is timer and bpy.app.timers.is_registered(timer)
+assert session.timer_callback is timer and not bpy.app.timers.is_registered(timer)
 assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
 assert all(not value for value in addon.input_value.values())
 assert scene.render.fps == 24 and math.isclose(scene.render.fps_base, 1.001, rel_tol=1e-6)
 
-# No resume/reinsert is needed for a second take, and cancel restores its mark.
+# No resume/reinsert is needed for a second take, and cancel restores the
+# persistent mark rather than the position where that take began.
 mario.mario_state.posX = 9.0
 mario.mario_state.posY = 8.0
 mario.mario_state.posZ = 7.0
-second_mark = mario.begin_mario_recording(scene)
+mario.begin_mario_recording(scene)
 timer()
 assert recorder.sample_count == 1
 recorder.cancel()
-mario.resume_live_idle_after_transition(second_mark)
+mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
-assert first.sm64_mario_create.calls[-1] == (9, 8, 7)
+assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
 
 # A failed bake can retain samples while live control safely returns to idle.
-failure_mark = mario.begin_mario_recording(scene)
+mario.begin_mario_recording(scene)
 timer()
 mario.freeze_mario_recording_for_bake()
 recorder.fail("injected bake failure", preserve_samples=True)
@@ -138,13 +143,13 @@ mario.abandon_bake_transition()
 assert recorder.has_pending_samples
 assert mario.live_control_status() == mario.LIVE_IDLE
 recorder.cancel()
-mario.resume_live_idle_after_transition(failure_mark)
+mario.return_to_start_mark_after_transition()
 
 # Keyboard latches are usable while idle and cleared by a reset.
 addon.config["keyboard_control"] = True
 addon.process_input(type("Event", (), {"type": "W", "value": "PRESS"})())
 assert addon.input_value["UP"]
-mario.resume_live_idle_after_transition(mario.capture_mario_starting_mark())
+mario.reset_to_persistent_start_mark()
 assert not addon.input_value["UP"]
 
 # Reinstalling is idempotent; stale generation callbacks cannot tick the next session.
@@ -175,7 +180,8 @@ assert mario.insert_mario("mock.z64", 100, False) is None
 poisoned_session = mario._lifecycle
 poisoned.sm64_mario_delete = NativeCall(failure=RuntimeError("injected reset delete failure"))
 try:
-    mario.resume_live_idle_after_transition(mario.capture_mario_starting_mark())
+    mario.set_persistent_start_mark()
+    mario.reset_to_persistent_start_mark()
     raise AssertionError("Reset deletion failure should poison live control")
 except mario.MarioLifecycleError as exc:
     assert "restart Blender" in str(exc)

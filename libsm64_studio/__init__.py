@@ -6,6 +6,9 @@ _MARIO_REQUIRED_API = (
     "BAKING", "LIVE_IDLE", "POISONED", "RECORDING", "RESETTING", "STOPPED",
     "abandon_bake_transition", "begin_mario_recording",
     "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
+    "clear_persistent_start_mark", "has_valid_start_mark",
+    "reset_to_persistent_start_mark", "return_to_start_mark_after_transition",
+    "set_persistent_start_mark",
 )
 
 
@@ -66,14 +69,19 @@ from . mario import (
     STOPPED,
     abandon_bake_transition,
     begin_mario_recording,
+    clear_persistent_start_mark,
     freeze_mario_recording_for_bake,
     get_live_mario_object,
     has_owned_native_session,
+    has_valid_start_mark,
     insert_mario,
     is_mario_running,
     live_control_error,
     live_control_status,
     resume_live_idle_after_transition,
+    reset_to_persistent_start_mark,
+    return_to_start_mark_after_transition,
+    set_persistent_start_mark,
     stop_tick_mario,
 )
 from . recording import (
@@ -106,7 +114,6 @@ from .take_manager import (
 )
 
 
-_recording_start_mark = None
 _confirmation_message = ""
 BUILD_ID = "2.3.0+live-control"
 
@@ -203,6 +210,11 @@ class LibSm64Properties(bpy.types.PropertyGroup):
         name="Show rejected takes",
         default=False,
     )
+    reset_to_mark_on_recording_start : bpy.props.BoolProperty(
+        name="Reset to Mark when recording starts",
+        description="Reset Live Mario to the persistent Start Mark before recording",
+        default=False,
+    )
 
 class LibSm64Preferences(bpy.types.AddonPreferences):
     bl_idname = __name__
@@ -265,6 +277,21 @@ class Main_PT_Panel(bpy.types.Panel):
                 box.label(text=live_control_error(), icon='INFO')
         else:
             box.label(text="Live Mario: Unavailable", icon='ERROR')
+
+        mark_row = box.row(align=True)
+        mark_row.enabled = control_status == LIVE_IDLE
+        mark_row.operator(SetStartMark_OT_Operator.bl_idname, text="Set Start Mark", icon='BOOKMARKS')
+        reset_mark = mark_row.row(align=True)
+        reset_mark.enabled = control_status == LIVE_IDLE and has_valid_start_mark()
+        reset_mark.operator(ResetToStartMark_OT_Operator.bl_idname, text="Reset to Mark", icon='LOOP_BACK')
+        mark_is_valid = has_valid_start_mark()
+        box.label(
+            text="Start Mark: {}".format("Set" if mark_is_valid else "Not set"),
+            icon='CHECKMARK' if mark_is_valid else 'INFO',
+        )
+        auto_reset = box.row()
+        auto_reset.enabled = mark_is_valid and control_status == LIVE_IDLE
+        auto_reset.prop(settings, "reset_to_mark_on_recording_start")
 
         primary = box.row()
         primary.scale_y = 1.6
@@ -411,17 +438,20 @@ class StartRecording_OT_Operator(bpy.types.Operator):
     bl_description = "Start capturing 30 Hz geometry from Live Mario's exact current position"
 
     def execute(self, context):
-        global _recording_start_mark
         if not is_mario_running():
             self.report({'ERROR'}, "Live Mario is not available for recording")
             return {'CANCELLED'}
-        previous_mark = _recording_start_mark
         had_pending_samples = recorder.has_pending_samples
+        settings = getattr(context.scene, "libsm64", None)
+        auto_reset = bool(
+            settings is not None
+            and settings.reset_to_mark_on_recording_start
+            and has_valid_start_mark()
+        )
         try:
-            _recording_start_mark = begin_mario_recording(context.scene)
+            begin_mario_recording(context.scene, reset_to_mark=auto_reset)
         except Exception as exc:
             abandon_bake_transition()
-            _recording_start_mark = previous_mark if had_pending_samples else None
             recorder.fail(
                 "Could not start recording: {}".format(exc),
                 preserve_samples=had_pending_samples,
@@ -429,6 +459,53 @@ class StartRecording_OT_Operator(bpy.types.Operator):
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
         self.report({'INFO'}, "Recording Mario geometry")
+        return {'FINISHED'}
+
+
+class SetStartMark_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_set_start_mark"
+    bl_label = "Set Start Mark"
+    bl_description = "Save Live Mario's current native position for repeatable takes"
+
+    @classmethod
+    def poll(cls, _context):
+        return is_mario_running() and live_control_status() == LIVE_IDLE
+
+    def execute(self, context):
+        try:
+            set_persistent_start_mark()
+        except Exception as exc:
+            _show_confirmation("Start Mark unavailable")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        _show_confirmation("✓ Start Mark set")
+        self.report({'INFO'}, "Start Mark set")
+        return {'FINISHED'}
+
+
+class ResetToStartMark_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_reset_to_start_mark"
+    bl_label = "Reset to Mark"
+    bl_description = "Recreate Live Mario at the persistent Start Mark"
+
+    @classmethod
+    def poll(cls, _context):
+        return (
+            is_mario_running()
+            and live_control_status() == LIVE_IDLE
+            and has_valid_start_mark()
+            and not recorder.active
+        )
+
+    def execute(self, context):
+        try:
+            reset_to_persistent_start_mark()
+        except Exception as exc:
+            _show_confirmation("Start Mark unavailable")
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        _show_confirmation("✓ Reset to Start Mark")
+        self.report({'INFO'}, "Reset to Start Mark")
         return {'FINISHED'}
 
 
@@ -440,7 +517,6 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
     )
 
     def execute(self, context):
-        global _recording_start_mark
         source_object = get_live_mario_object()
         try:
             samples = freeze_mario_recording_for_bake()
@@ -478,18 +554,14 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
         label = "Take {:03d}".format(take_number)
         recorder.complete(label)
         try:
-            if _recording_start_mark is None:
-                raise RuntimeError("The recording starting mark is unavailable")
-            resume_live_idle_after_transition(_recording_start_mark)
+            return_to_start_mark_after_transition()
         except Exception as exc:
             abandon_bake_transition()
-            _recording_start_mark = None
             self.report(
                 {'ERROR'},
-                "{} was captured, but Live Mario is unavailable: {}".format(label, exc),
+                "{} was captured, but reset to Start Mark failed: {}".format(label, exc),
             )
             return {'FINISHED'}
-        _recording_start_mark = None
         _show_confirmation("âœ“ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
@@ -501,21 +573,16 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
 class CancelRecording_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_cancel_recording"
     bl_label = "Cancel Recording"
-    bl_description = "Discard the pending take, restore its start mark, and keep Live Mario controllable"
+    bl_description = "Discard the pending take and return Live Mario to the persistent Start Mark"
 
     def execute(self, context):
-        global _recording_start_mark
-        mark = _recording_start_mark
         recorder.cancel()
-        _recording_start_mark = None
-        if mark is not None and is_mario_running():
-            try:
-                resume_live_idle_after_transition(mark)
-            except Exception as exc:
-                self.report({'ERROR'}, "Recording discarded, but Live Mario is unavailable: {}".format(exc))
-                return {'CANCELLED'}
-        else:
+        try:
+            return_to_start_mark_after_transition()
+        except Exception as exc:
             abandon_bake_transition()
+            self.report({'ERROR'}, "Recording discarded, but reset to Start Mark failed: {}".format(exc))
+            return {'FINISHED'}
         self.report({'INFO'}, "Mario recording discarded")
         return {'FINISHED'}
 
@@ -604,9 +671,8 @@ class EndMarioControl_OT_Operator(bpy.types.Operator):
     bl_description = "End live control and permanently remove all rejected takes"
 
     def execute(self, context):
-        global _recording_start_mark
         recorder.cancel("Mario control ended")
-        _recording_start_mark = None
+        clear_persistent_start_mark()
         stop_tick_mario()
         config["keyboard_control"] = False
         for key in input_value:
@@ -656,6 +722,8 @@ register_classes, unregister_classes = bpy.utils.register_classes_factory((
     Main_PT_Panel,
     InsertMario_OT_Operator,
     ControlMario_OT_Operator,
+    SetStartMark_OT_Operator,
+    ResetToStartMark_OT_Operator,
     StartRecording_OT_Operator,
     StopAndBake_OT_Operator,
     CancelRecording_OT_Operator,
@@ -680,9 +748,9 @@ def register():
     atexit.register(_shutdown_owned_session_at_exit)
 
 def unregister():
-    global _recording_start_mark, _confirmation_message
+    global _confirmation_message
     recorder.cancel("Add-on unregistered")
-    _recording_start_mark = None
+    clear_persistent_start_mark()
     _confirmation_message = ""
     if bpy.app.timers.is_registered(_clear_confirmation):
         bpy.app.timers.unregister(_clear_confirmation)

@@ -119,6 +119,7 @@ class NativeLifecycle:
         self.last_error = ""
         self.neutral_input_ticks = 0
         self.recording_tick_origin = None
+        self.persistent_start_mark = None
         self.native_ownership_uncertain = False
         self.shutdown_in_progress = False
         self.shutdown_complete = False
@@ -602,6 +603,72 @@ def capture_mario_starting_mark():
     }
 
 
+def _valid_persistent_start_mark(session=None):
+    """Return this generation's mark data, or None for stale/unowned state."""
+    session = session or _lifecycle
+    stored = session.persistent_start_mark
+    if not isinstance(stored, dict):
+        return None
+    if stored.get("owner_token") != session.owner_token:
+        return None
+    if stored.get("generation") != session.generation:
+        return None
+    mark = stored.get("mark")
+    if not isinstance(mark, dict) or "position" not in mark:
+        return None
+    if session is not _lifecycle or not is_mario_running():
+        return None
+    return mark
+
+
+def has_valid_start_mark():
+    """Whether the running Live Mario owns a usable persistent Start Mark."""
+    return _valid_persistent_start_mark() is not None
+
+
+def set_persistent_start_mark():
+    """Capture and replace the active generation's persistent Start Mark."""
+    session = _lifecycle
+    if not is_mario_running() or session.control_state != LIVE_IDLE:
+        raise RuntimeError("Live Mario is not ready to set a Start Mark")
+    mark = capture_mario_starting_mark()
+    session.persistent_start_mark = {
+        "owner_token": session.owner_token,
+        "generation": session.generation,
+        "mark": mark,
+    }
+    return mark
+
+
+def clear_persistent_start_mark(session=None):
+    """Forget a Start Mark without touching native Mario state."""
+    (session or _lifecycle).persistent_start_mark = None
+
+
+def reset_to_persistent_start_mark():
+    """Safely recreate Live Mario at this generation's persistent mark."""
+    session = _lifecycle
+    if recorder.active or session.control_state == RECORDING:
+        raise RuntimeError("Reset to Mark is unavailable while recording")
+    if session.control_state != LIVE_IDLE:
+        raise RuntimeError("Live Mario is not ready to reset")
+    mark = _valid_persistent_start_mark(session)
+    if mark is None:
+        raise RuntimeError("Start Mark unavailable")
+
+    session.control_state = RESETTING
+    try:
+        restore_mario_starting_mark(mark)
+        session.recording_tick_origin = None
+        session.control_state = LIVE_IDLE
+        resume_mario_for_recording()
+    except Exception:
+        if session.control_state != POISONED:
+            session.control_state = LIVE_IDLE if is_mario_running() else STOPPED
+        raise
+    return mark
+
+
 def restore_mario_starting_mark(mark):
     """Recreate libsm64 Mario at a mark, clearing all transient internal state.
 
@@ -673,30 +740,31 @@ def resume_mario_for_recording():
 
 
 def pause_mario_for_review():
-    """Compatibility no-op: timeline review no longer pauses Live Mario."""
+    """Pause Live Mario ticks while preserving the owned native session."""
     if is_mario_running():
-        _install_tick_timer(_lifecycle)
+        remove_tick_mario_timer(_lifecycle)
 
 
-def begin_mario_recording(scene):
-    """Atomically capture the current mark and layer capture over live simulation."""
+def begin_mario_recording(scene, reset_to_mark=False):
+    """Atomically prepare optional Start Mark reset, then begin capture."""
     session = _lifecycle
     if not is_mario_running() or session.control_state != LIVE_IDLE:
         raise RuntimeError("Live Mario is not ready to record")
     if recorder.has_pending_samples:
         raise RuntimeError("Cancel or finish the pending take before recording again")
-    mark = capture_mario_starting_mark()
     try:
+        if reset_to_mark:
+            reset_to_persistent_start_mark()
         recorder.start(float(scene.frame_current), get_simulation_target_fps(scene))
         session.recording_tick_origin = tick_count
         session.control_state = RECORDING
         _install_tick_timer(session)
     except Exception:
+        recorder.cancel("Recording did not start")
         session.recording_tick_origin = None
-        if is_mario_running():
+        if session.control_state != POISONED and is_mario_running():
             session.control_state = LIVE_IDLE
         raise
-    return mark
 
 
 def freeze_mario_recording_for_bake():
@@ -727,6 +795,23 @@ def resume_live_idle_after_transition(mark):
     session.recording_tick_origin = None
     session.control_state = LIVE_IDLE
     _install_tick_timer(session)
+
+
+def return_to_start_mark_after_transition():
+    """Return to a valid Start Mark, then pause Live Mario for review."""
+    session = _lifecycle
+    valid_mark = has_valid_start_mark()
+    if recorder.active:
+        raise RuntimeError("Cannot finish the recording transition while capture is active")
+    if session.control_state in (RECORDING, BAKING):
+        session.control_state = LIVE_IDLE
+    if valid_mark:
+        mark = reset_to_persistent_start_mark()
+    else:
+        abandon_bake_transition()
+        mark = None
+    pause_mario_for_review()
+    return mark
 
 
 def abandon_bake_transition():
@@ -837,6 +922,7 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
         original_fps_setting = 0
         original_fps_base = 1.0
         simulation_scene = None
+        clear_persistent_start_mark(session)
         if errors:
             session.control_state = POISONED
             session.last_error = "; ".join(errors)

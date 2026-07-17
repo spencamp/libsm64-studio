@@ -52,7 +52,7 @@ class PackageImportContractTests(unittest.TestCase):
                 LIFECYCLE_SYMBOLS,
             )
 
-    def test_recording_transition_symbol_owns_start_mark_capture(self):
+    def test_start_mark_api_is_explicit_and_recording_does_not_capture_it(self):
         mario_tree = ast.parse((PACKAGE / "mario.py").read_text(encoding="utf-8"))
         definitions = {
             node.name for node in mario_tree.body
@@ -60,6 +60,21 @@ class PackageImportContractTests(unittest.TestCase):
         }
         self.assertIn("capture_mario_starting_mark", definitions)
         self.assertIn("begin_mario_recording", definitions)
+        for symbol in (
+            "set_persistent_start_mark", "has_valid_start_mark",
+            "reset_to_persistent_start_mark", "clear_persistent_start_mark",
+        ):
+            self.assertIn(symbol, definitions)
+
+        begin = next(
+            node for node in mario_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "begin_mario_recording"
+        )
+        called_names = {
+            node.func.id for node in ast.walk(begin)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("capture_mario_starting_mark", called_names)
 
         init_tree = ast.parse((PACKAGE / "__init__.py").read_text(encoding="utf-8"))
         mario_imports = {
