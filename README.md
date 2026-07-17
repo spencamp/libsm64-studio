@@ -69,6 +69,23 @@ and 60):
 9. Install a temporary unrelated `frame_change_pre` handler, run and stop another
    simulation, and verify that handler remains installed.
 
+### Texture persistence acceptance test
+
+1. Insert Mario and confirm the normal red, blue, and skin colors are visible.
+2. Record and bake at least two takes.
+3. Save the `.blend` and close Blender completely.
+4. Reopen the saved file without clicking **Insert Mario**.
+5. Switch the viewport to Material Preview and confirm every baked Mario is fully
+   textured rather than black.
+6. Press Play and confirm both the animation and texture continue to work.
+7. Temporarily disable the add-on, reopen the file if Blender requests it, and
+   confirm the baked Marios remain textured and animated without the ROM or
+   libsm64 being loaded.
+
+The generated `libsm64_mario_texture` image is shared by all live and baked Mario
+objects and is packed into the `.blend`. Inserting Mario again refreshes that
+single packed image from the ROM; it does not create a texture per take.
+
 ### Current Features
 - Insert playable Mario into Blender scene
 - Fast64 terrain type and collision surface type support

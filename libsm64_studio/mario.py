@@ -1,6 +1,5 @@
 import bpy
 import bmesh
-from array import array
 import os
 import platform
 import ctypes as ct
@@ -382,83 +381,26 @@ def get_all_surfaces():
 
     return out
 
-def _new_mario_texture_image():
-    image = bpy.data.images.new(
-        "libsm64_mario_texture",
-        width=SM64_TEXTURE_WIDTH,
-        height=SM64_TEXTURE_HEIGHT,
-        alpha=True,
-    )
-    image.source = 'GENERATED'
-    image.generated_type = 'BLANK'
-    return image
-
-
-def _prepare_mario_texture_image():
-    """Return a writable generated image and any unusable image it replaced."""
-    image = bpy.data.images.get("libsm64_mario_texture")
-    if image is None:
-        return _new_mario_texture_image(), None
-
-    try:
-        if getattr(image, "packed_file", None) is not None:
-            # image.pack() changes GENERATED images to FILE-backed packed images.
-            # Remove that old encoded payload before replacing the pixel buffer.
-            image.unpack(method='REMOVE')
-        image.source = 'GENERATED'
-        image.generated_type = 'BLANK'
-        image.generated_width = SM64_TEXTURE_WIDTH
-        image.generated_height = SM64_TEXTURE_HEIGHT
-        if tuple(image.size) != (SM64_TEXTURE_WIDTH, SM64_TEXTURE_HEIGHT):
-            image.scale(SM64_TEXTURE_WIDTH, SM64_TEXTURE_HEIGHT)
-        if (not image.has_data or
-                len(image.pixels) != SM64_TEXTURE_WIDTH * SM64_TEXTURE_HEIGHT * 4):
-            raise RuntimeError("Mario texture image has no usable pixel buffer")
-        return image, None
-    except (RuntimeError, TypeError, ValueError):
-        # Preserve an image used elsewhere, but free the canonical name so the
-        # shared Mario material can be repaired to reference a valid replacement.
-        image.name = "libsm64_mario_texture_invalid"
-        return _new_mario_texture_image(), image
-
-
-def initialize_texture_image(texture_buffer):
-    """Write, update, pack, and verify the shared ROM-generated Mario texture."""
-    expected_length = SM64_TEXTURE_WIDTH * SM64_TEXTURE_HEIGHT * 4
-    if len(texture_buffer) != expected_length:
-        raise ValueError(
-            "Mario texture buffer has {} bytes; expected {}".format(
-                len(texture_buffer), expected_length
-            )
-        )
-
-    image, replaced_image = _prepare_mario_texture_image()
-    pixels = array('f', (float(channel) / 255.0 for channel in texture_buffer))
+def initialize_all_data(texture_buffer):
+    size = SM64_TEXTURE_WIDTH, SM64_TEXTURE_HEIGHT
+    if 'libsm64_mario_texture' in bpy.data.images:
+        image = bpy.data.images["libsm64_mario_texture"]
+    else:
+        image = bpy.data.images.new("libsm64_mario_texture", width=size[0], height=size[1])
+    pixels = [None] * size[0] * size[1]
+    i = 0
+    for y in range(size[1]):
+        for x in range(size[0]):
+            r = float(texture_buffer[i]) / 255
+            g = float(texture_buffer[i+1]) / 255
+            b = float(texture_buffer[i+2]) / 255
+            a = float(texture_buffer[i+3]) / 255
+            i += 4
+            pixels[(y * size[0]) + x] = [r, g, b, a]
+    pixels = [chan for px in pixels for chan in px]
     image.alpha_mode = 'STRAIGHT'
     image.file_format = 'PNG'
-    image.pixels.foreach_set(pixels)
-    image.update()
-
-    # Packing encodes the current generated buffer into the .blend. It must
-    # happen after update(), otherwise Blender can preserve the previous/black
-    # encoded payload even though the in-memory pixels look correct.
-    image.pack()
-    image.update()
-    if getattr(image, "packed_file", None) is None:
-        raise RuntimeError("Blender did not pack the generated Mario texture")
-    if tuple(image.size) != (SM64_TEXTURE_WIDTH, SM64_TEXTURE_HEIGHT):
-        raise RuntimeError("Packed Mario texture has invalid dimensions")
-
-    verified_pixels = array('f', [0.0]) * expected_length
-    image.pixels.foreach_get(verified_pixels)
-    if any(abs(actual - expected) > 1e-6
-           for actual, expected in zip(verified_pixels, pixels)):
-        raise RuntimeError("Packed Mario texture does not match the ROM pixel buffer")
-    return image, replaced_image
-
-
-def initialize_all_data(texture_buffer):
-    image, replaced_image = initialize_texture_image(texture_buffer)
+    image.pixels = pixels
 
     if 'libsm64_mario_material' in bpy.data.materials:
         mat = bpy.data.materials["libsm64_mario_material"]
@@ -485,19 +427,6 @@ def initialize_all_data(texture_buffer):
         links.new(color_node.outputs[0], mix_node.inputs[6])
         links.new(mix_node.outputs[2], diffuse_node.inputs[0])
         links.new(diffuse_node.outputs[0], out_node.inputs[0])
-
-    # Existing baked objects share this material. Repairing its image node once
-    # therefore repairs every take without duplicating texture datablocks.
-    if mat.use_nodes and mat.node_tree:
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and (
-                    node.image is replaced_image or
-                    node.image is None or
-                    node.image.name.startswith("libsm64_mario_texture")):
-                node.image = image
-
-    if replaced_image is not None and replaced_image.users == 0:
-        bpy.data.images.remove(replaced_image)
 
     if not ('libsm64_mario_mesh' in bpy.data.meshes):
         mesh = bpy.data.meshes.new('libsm64_mario_mesh')
