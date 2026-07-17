@@ -45,9 +45,10 @@ assert all(
     for curve in curves
     for point in curve.keyframe_points
 )
-assert bpy.context.scene.frame_end >= 11
-assert bpy.context.view_layer.objects.active is bake
-assert source.hide_render
+assert bpy.context.scene.frame_end == 1
+assert bake.hide_render
+assert bake.hide_get()
+assert not source.hide_render
 bpy.context.scene.frame_set(10)
 assert bake.data.shape_keys.key_blocks[1].value == 1.0
 assert bake.data.shape_keys.key_blocks[2].value == 0.0
@@ -79,6 +80,35 @@ package_spec.loader.exec_module(addon)
 addon.register()
 assert hasattr(bpy.types.Scene, "libsm64")
 
+# Existing bakes are migrated to stable take metadata. Exercise the explicit
+# current/favorite/rejected transitions without changing the timeline.
+addon.take_manager.reconcile_scene(bpy.context.scene)
+assert bake[addon.take_manager.TAKE_NUMBER] == 1
+assert second[addon.take_manager.TAKE_NUMBER] == 2
+addon.take_manager.favorite_take(bpy.context.scene, bake)
+bpy.context.scene.frame_set(17, subframe=0.5)
+frame_before = bpy.context.scene.frame_current_final
+addon.take_manager.select_take(bpy.context, second)
+assert bpy.context.scene.frame_current_final == frame_before
+assert not bake.hide_render
+assert not second.hide_render
+addon.take_manager.reject_take(bpy.context.scene, second)
+assert second.hide_render
+assert addon.take_manager.current_take(bpy.context.scene) is None
+addon.take_manager.restore_take(bpy.context, second)
+assert addon.take_manager.current_take(bpy.context.scene) is second
+addon.take_manager.favorite_take(bpy.context.scene, second)
+try:
+    addon.take_manager.reject_take(bpy.context.scene, second)
+    raise AssertionError("Favorite rejection should be protected")
+except addon.take_manager.TakeError:
+    pass
+addon.take_manager.unfavorite_take(bpy.context.scene, second)
+addon.take_manager.reject_take(bpy.context.scene, second)
+rejected_object_name = second.name
+rejected_mesh_name = second.data.name
+rejected_action_name = second.data.shape_keys.animation_data.action.name
+
 
 def unrelated_handler(scene, depsgraph=None):
     pass
@@ -86,13 +116,31 @@ def unrelated_handler(scene, depsgraph=None):
 
 handlers = bpy.app.handlers.frame_change_pre
 handlers.append(unrelated_handler)
-handlers.append(addon.mario.tick_mario)
-handlers.append(addon.mario.tick_mario)
-assert addon.mario.remove_tick_mario_handlers() == 2
+assert addon.mario.remove_tick_mario_handlers() == 0
 assert unrelated_handler in handlers
 addon.mario.stop_tick_mario()
 addon.mario.stop_tick_mario()
 assert unrelated_handler in handlers
+assert addon.take_manager.cleanup_rejected(bpy.context.scene) == 1
+assert bpy.data.objects.get(rejected_object_name) is None
+assert bpy.data.meshes.get(rejected_mesh_name) is None
+assert bpy.data.actions.get(rejected_action_name) is None
+assert bpy.data.objects.get(bake.name) is bake
+
+# Exercise actual Blender action creation at the other common output rates;
+# the 24 FPS bake above also covers fractional placement.
+for target_fps in (30, 60):
+    timing_bake = recording.bake_shape_keys(
+        bpy.context, source, (sample_a, sample_b), start_frame=5, target_fps=target_fps
+    )
+    timing_curves = list(recording.iter_action_fcurves(
+        timing_bake.data.shape_keys.animation_data.action
+    ))
+    expected_second_frame = recording.sample_target_frame(5, 1, target_fps)
+    assert any(
+        abs(point.co[0] - expected_second_frame) < 1e-6
+        for point in timing_curves[1].keyframe_points
+    )
 addon.unregister()
 assert unrelated_handler in handlers
 handlers.remove(unrelated_handler)

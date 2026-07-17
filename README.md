@@ -17,20 +17,39 @@ Only Windows and linux are currently supported, no MacOS support yet unfortunate
 Download the latest release zip [from here](https://github.com/libsm64/libsm64-blender/releases). In Blender, go to Edit -> Preferences -> Add-Ons and click the "Install" button to install the plugin from the zip file. Find the libsm64-blender addon in the addon list and enable it. If it does not show up, go to Edit -> Preferences -> Save&Load and make sure 'Auto Run Python Scripts' is enabled.
 
 ### Usage
-Before opening Blender make sure you have an XInput controller connected if you want to control Mario with a controller. Alternatively you can use the keyboard to control him. With the add-on enabled there should be a LibSM64 tab in the properties sidebar. Browse to an unmodified SM64 US z64 ROM, and then click the "Insert Mario" button to insert a controllable Mario at the 3D cursor location. To stop the simulation just delete the "LibSM64 Mario" object from the scene.
+Before opening Blender make sure you have an XInput controller connected if you want to control Mario with a controller. Alternatively you can use the keyboard to control him. With the add-on enabled there should be a LibSM64 tab in the properties sidebar. Browse to an unmodified SM64 US z64 ROM, and then click the "Insert Mario" button to insert a controllable Mario at the 3D cursor location. Use **End Mario Control** when finished; this also performs deferred rejected-take cleanup.
 
 *Note:* The SM64 US ROM must be the one with the SHA1 checksum of `9bef1128717f958171a4afac3ed78ee2bb4e86ce`.
 
-### Recording short animations
+### Recording performance takes
 
-The **Animation Recording** section in the LibSM64 sidebar can turn a short live
-performance into a self-contained Blender mesh animation:
+The **Performance Recording** section is built around one controllable Live Mario
+and any number of baked takes:
 
 1. Set the scene FPS, insert Mario, and control him normally.
 2. Move the timeline to the desired output start frame and click **Start Recording**.
 3. Perform the take, then click **Stop & Bake**.
-4. Scrub or render the selected `LibSM64 Mario Bake` object. The live object is
-   stopped and hidden after a successful bake.
+4. Live Mario returns to the mark captured at recording start, with transient
+   movement state cleared. Blender's output FPS is restored for review.
+5. Scrub or play the result with Blender's normal timeline controls, favorite or
+   reject it, or click **Start Recording** immediately for one more take.
+
+Takes appear as `Take 001`, `Take 002`, and so on. Numbers increase monotonically
+and are not reused after deletion. The current regular take is visible; selecting
+another regular take hides the previous one without changing the current frame or
+playback state. Favorites remain visible together, including while another take
+is current. Unfavoriting never rejects a take.
+
+Rejecting a regular take hides it and moves it into the collapsed **Rejected**
+section. It can be restored until live control ends. Favorites must be unfavorited
+before rejection. **End Mario Control** permanently removes rejected take objects
+and their exclusively owned animation data while preserving regular takes,
+favorites, shared materials, and the packed Mario texture.
+
+Take identity, number, disposition, current selection, and the next number are
+stored in the `.blend` as stable metadata, so object renaming and reordering do
+not break the take manager. The inline capture confirmation disappears after
+about two seconds and does not require dismissing a dialog.
 
 The bake has one shape key per 30 Hz libsm64 sample and uses constant
 interpolation. Samples are placed at fractional frames when necessary, preserving
@@ -47,7 +66,8 @@ blinking/facial UV changes, changing vertex colors, simulation, and collision ar
 not part of baked playback. Blender calculates displayed normals from the
 deformed geometry.
 
-Use **Cancel Recording** to discard a pending take without stopping Mario.
+Use **Cancel Recording** to discard a pending take and return Live Mario to the
+captured starting mark without creating a take.
 
 ### Manual recording smoke test
 
@@ -57,17 +77,23 @@ and 60):
 1. Open Blender with the add-on enabled and set the scene FPS.
 2. Add collision ground, place the 3D cursor over it, and insert Mario.
 3. Start recording and control Mario for approximately four seconds.
-4. Click **Stop & Bake** and confirm the baked object is selected, the live object
-   is hidden, and the scene FPS has returned to its original value.
+4. Click **Stop & Bake** and confirm `Take 001` is selected and visible, Live
+   Mario returns to its starting mark, and the scene FPS returns to its original
+   value.
 5. Scrub from the recording start frame through the take. Confirm poses are held,
    do not blend, and the duration is about four seconds.
 6. Render frames in Eevee and Cycles.
 7. Save the `.blend`, close Blender, disconnect the controller or make the ROM
    unavailable, reopen the file, and verify the bake still scrubs and renders.
-8. Insert Mario again, record a second take, and verify the first bake and its
-   action remain unchanged.
+8. Without reinserting Mario, record `Take 002` and verify `Take 001` is hidden
+   while its mesh and action remain unchanged.
 9. Install a temporary unrelated `frame_change_pre` handler, run and stop another
    simulation, and verify that handler remains installed.
+10. Favorite a take and record another; confirm both remain visible. Reject two
+    regular takes, end Mario control, and confirm only rejected take-owned data is
+    deleted.
+11. Save and reopen a file containing regular, favorite, and rejected takes;
+    verify categories, current visibility, and the next take number are restored.
 
 ### Texture persistence acceptance test
 

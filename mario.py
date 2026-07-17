@@ -1,11 +1,13 @@
 import bpy
 import bmesh
 from array import array
+import hashlib
 import os
 import platform
 import ctypes as ct
 import math
 import mathutils
+import uuid
 from typing import cast, List
 from . collision_types import COLLISION_TYPES
 from . recording import recorder
@@ -19,6 +21,10 @@ SM64_TEXTURE_WIDTH = 64 * 11
 SM64_TEXTURE_HEIGHT = 64
 SM64_GEO_MAX_TRIANGLES = 1024
 SM64_SCALE_FACTOR = 50
+LIVE_ROLE = "libsm64_live_role"
+LIVE_ROLE_VALUE = "LIVE_MARIO"
+EXPECTED_ROM_SHA1 = "9bef1128717f958171a4afac3ed78ee2bb4e86ce"
+LIFECYCLE_REGISTRY_KEY = "libsm64_studio_native_lifecycle"
 
 origin_offset = [0.0, 0.0, 0.0]
 original_fps = 0
@@ -75,6 +81,55 @@ class SM64MarioGeometryBuffers(ct.Structure):
     def __del__(self):
         pass
 
+class MarioLifecycleError(RuntimeError):
+    pass
+
+
+class NativeLifecycle:
+    """Explicit ownership record for exactly one native libsm64 session."""
+
+    def __init__(self, generation):
+        self.owner_token = _MODULE_OWNER_TOKEN
+        self.generation = generation
+        self.library = None
+        self.library_loaded = False
+        self.global_init_attempted = False
+        self.global_initialized = False
+        self.mario_create_attempted = False
+        self.mario_created = False
+        self.mario_id = -1
+        self.tick_handler = None
+        self.tick_handler_installed = False
+        self.shutdown_in_progress = False
+        self.shutdown_complete = False
+        self.session_committed = False
+        self.mario_delete_attempted = False
+        self.global_terminate_attempted = False
+        self.live_object = None
+        self.live_object_name = ""
+        self.scene = None
+        self.input_started = False
+
+
+_MODULE_OWNER_TOKEN = uuid.uuid4().hex
+
+
+def _lifecycle_registry():
+    registry = bpy.app.driver_namespace.get(LIFECYCLE_REGISTRY_KEY)
+    if not isinstance(registry, dict):
+        registry = {"next_generation": 0, "active": None}
+        bpy.app.driver_namespace[LIFECYCLE_REGISTRY_KEY] = registry
+    return registry
+
+
+def _new_lifecycle():
+    registry = _lifecycle_registry()
+    registry["next_generation"] = int(registry.get("next_generation", 0)) + 1
+    return NativeLifecycle(registry["next_generation"])
+
+
+_lifecycle = _new_lifecycle()
+_lifecycle.shutdown_complete = True
 sm64: ct.CDLL = None
 sm64_mario_id = -1
 
@@ -85,118 +140,450 @@ follow_cam = False
 tick_count = 0
 last_cam_change_tick = -30
 
-def insert_mario(rom_path: str, scale: float, camera_follow: bool):
-    global sm64, sm64_mario_id, SM64_SCALE_FACTOR, original_fps, original_fps_setting
-    global original_fps_base, tick_count, origin_offset, original_cursor_pos, follow_cam, simulation_scene
+def _lifecycle_log(session, message):
+    print("libsm64 lifecycle [{}] {}".format(session.generation, message))
 
-    SM64_SCALE_FACTOR = scale
 
+def lifecycle_snapshot():
+    session = _lifecycle
+    return {
+        "owner_token": session.owner_token,
+        "generation": session.generation,
+        "library_loaded": session.library_loaded,
+        "global_init_attempted": session.global_init_attempted,
+        "global_initialized": session.global_initialized,
+        "mario_create_attempted": session.mario_create_attempted,
+        "mario_created": session.mario_created,
+        "mario_id": session.mario_id,
+        "tick_handler_installed": session.tick_handler_installed,
+        "shutdown_in_progress": session.shutdown_in_progress,
+        "shutdown_complete": session.shutdown_complete,
+        "session_committed": session.session_committed,
+    }
+
+
+def _publish_session(session):
+    _lifecycle_registry()["active"] = {
+        "owner_token": session.owner_token,
+        "generation": session.generation,
+        "session": session,
+        "shutdown": lambda: stop_tick_mario(_session=session),
+    }
+
+
+def _session_is_registered_owner(session):
+    active = _lifecycle_registry().get("active")
+    return bool(
+        active
+        and active.get("owner_token") == session.owner_token
+        and active.get("generation") == session.generation
+        and active.get("session") is session
+    )
+
+
+def _release_session(session):
+    registry = _lifecycle_registry()
+    if _session_is_registered_owner(session):
+        registry["active"] = None
+
+
+def _retire_registered_session():
+    active = _lifecycle_registry().get("active")
+    if not active:
+        return
+    shutdown = active.get("shutdown")
+    if not callable(shutdown):
+        raise MarioLifecycleError(
+            "Native lifecycle ownership is inconsistent; restart Blender before inserting Mario"
+        )
+    errors = shutdown()
+    if errors:
+        raise MarioLifecycleError(
+            "The previous native session failed to shut down cleanly; restart Blender: {}".format(
+                "; ".join(errors)
+            )
+        )
+    if _lifecycle_registry().get("active"):
+        raise MarioLifecycleError(
+            "The previous native session did not shut down cleanly; restart Blender"
+        )
+
+
+def _read_validated_rom(rom_path):
+    expanded = os.path.expanduser(rom_path or "")
+    if not expanded or not os.path.isfile(expanded):
+        raise MarioLifecycleError("Select a valid unmodified SM64 US ROM")
+    with open(expanded, "rb") as rom_file:
+        rom_bytes = bytearray(rom_file.read())
+    checksum = hashlib.sha1(rom_bytes).hexdigest()
+    if checksum != EXPECTED_ROM_SHA1:
+        raise MarioLifecycleError("The selected ROM is not the supported unmodified SM64 US ROM")
+    return rom_bytes
+
+
+def _load_native_library():
+    this_path = os.path.dirname(os.path.realpath(__file__))
+    dll_name = 'sm64.dll' if platform.system() == 'Windows' else 'libsm64.so'
+    return ct.cdll.LoadLibrary(os.path.join(this_path, 'lib', dll_name))
+
+
+def _configure_native_api(library):
+    """Configure the 2022 libsm64 ABI shipped in this repository."""
+    library.sm64_global_init.argtypes = [
+        ct.POINTER(ct.c_ubyte), ct.POINTER(ct.c_ubyte), ct.c_char_p,
+    ]
+    library.sm64_global_init.restype = None
+    library.sm64_global_terminate.argtypes = []
+    library.sm64_global_terminate.restype = None
+    library.sm64_static_surfaces_load.argtypes = [ct.POINTER(SM64Surface), ct.c_uint32]
+    library.sm64_static_surfaces_load.restype = None
+    library.sm64_mario_create.argtypes = [ct.c_int16, ct.c_int16, ct.c_int16]
+    library.sm64_mario_create.restype = ct.c_int32
+    library.sm64_mario_delete.argtypes = [ct.c_uint32]
+    library.sm64_mario_delete.restype = None
+    library.sm64_mario_tick.argtypes = [
+        ct.c_uint32,
+        ct.POINTER(SM64MarioInputs),
+        ct.POINTER(SM64MarioState),
+        ct.POINTER(SM64MarioGeometryBuffers),
+    ]
+    library.sm64_mario_tick.restype = None
+
+
+def _make_tick_handler(session):
+    def session_tick(scene, depsgraph=None):
+        if not _session_is_registered_owner(session):
+            return 0
+        if session.shutdown_in_progress or session.shutdown_complete:
+            return 0
+        return tick_mario(scene, depsgraph, _session=session)
+
+    session_tick.__name__ = "libsm64_session_tick"
+    session_tick._libsm64_owner_token = session.owner_token
+    session_tick._libsm64_generation = session.generation
+    return session_tick
+
+
+def _install_tick_handler(session):
+    remove_tick_mario_handlers(session)
+    if session.tick_handler is None:
+        session.tick_handler = _make_tick_handler(session)
+    bpy.app.handlers.frame_change_pre.append(session.tick_handler)
+    session.tick_handler_installed = True
+    _lifecycle_log(session, "tick installed")
+
+
+def _create_live_object():
+    mario_obj = bpy.data.objects.new('LibSM64 Mario', bpy.data.meshes['libsm64_mario_mesh'])
+    mario_obj[LIVE_ROLE] = LIVE_ROLE_VALUE
+    bpy.context.scene.collection.objects.link(mario_obj)
+    return mario_obj
+
+
+def _prepare_blender_for_insert():
     try:
         bpy.ops.object.mode_set(mode='OBJECT')
-    except:
+    except Exception:
         pass
     bpy.ops.object.select_all(action='DESELECT')
 
-    original_cursor_pos = [
-        bpy.context.scene.cursor.location.x,
-        bpy.context.scene.cursor.location.y,
-        bpy.context.scene.cursor.location.z
-    ]
-    follow_cam = camera_follow
 
-    origin_offset[0] = bpy.context.scene.cursor.location.x
-    origin_offset[1] = bpy.context.scene.cursor.location.y
-    origin_offset[2] = bpy.context.scene.cursor.location.z
+def _start_blender_playback():
+    bpy.ops.screen.animation_play()
 
-    if sm64 is not None:
-        stop_tick_mario()
-    recorder.cancel("Ready for a new take")
 
-    if 'LibSM64 Mario' in bpy.data.objects:
-        bpy.data.objects['LibSM64 Mario'].select_set(True) # Blender 2.8x
-        bpy.ops.object.delete()
+def _cancel_blender_playback():
+    try:
+        bpy.ops.screen.animation_cancel()
+    except (RuntimeError, AttributeError):
+        pass
 
-    stop_input_reader()
 
-    this_path = os.path.dirname(os.path.realpath(__file__))
-    dll_name = 'sm64.dll' if platform.system() == 'Windows' else 'libsm64.so'
-    dll_path = os.path.join(this_path, 'lib', dll_name)
-    sm64 = ct.cdll.LoadLibrary(dll_path)
+def insert_mario(rom_path: str, scale: float, camera_follow: bool):
+    global _lifecycle, sm64, sm64_mario_id
+    global SM64_SCALE_FACTOR, original_fps, original_fps_setting
+    global original_fps_base, tick_count, origin_offset, original_cursor_pos, follow_cam, simulation_scene
 
-    sm64.sm64_global_init.argtypes = [ ct.c_char_p, ct.POINTER(ct.c_ubyte), ct.c_char_p ]
-    sm64.sm64_static_surfaces_load.argtypes = [ ct.POINTER(SM64Surface), ct.c_uint32 ]
-    sm64.sm64_mario_create.argtypes = [ ct.c_int16, ct.c_int16, ct.c_int16 ]
-    sm64.sm64_mario_create.restype = ct.c_int32
-    sm64.sm64_mario_tick.argtypes = [ ct.c_uint32, ct.POINTER(SM64MarioInputs), ct.POINTER(SM64MarioState), ct.POINTER(SM64MarioGeometryBuffers) ]
+    try:
+        rom_bytes = _read_validated_rom(rom_path)
+    except MarioLifecycleError as exc:
+        return str(exc)
 
-    with open(os.path.expanduser(rom_path), 'rb') as file:
-        rom_bytes = bytearray(file.read())
-        rom_chars = ct.c_char * len(rom_bytes)
+    try:
+        _retire_registered_session()
+    except MarioLifecycleError as exc:
+        return str(exc)
+
+    session = _new_lifecycle()
+    _lifecycle = session
+    _publish_session(session)
+
+    SM64_SCALE_FACTOR = scale
+    try:
+        _prepare_blender_for_insert()
+
+        original_cursor_pos = [
+            bpy.context.scene.cursor.location.x,
+            bpy.context.scene.cursor.location.y,
+            bpy.context.scene.cursor.location.z
+        ]
+        follow_cam = camera_follow
+
+        origin_offset[0] = bpy.context.scene.cursor.location.x
+        origin_offset[1] = bpy.context.scene.cursor.location.y
+        origin_offset[2] = bpy.context.scene.cursor.location.z
+
+        recorder.cancel("Ready for a new take")
+
+        existing_live = get_live_mario_object()
+        if existing_live is not None:
+            bpy.data.objects.remove(existing_live, do_unlink=True)
+    except Exception as exc:
+        stop_tick_mario(_session=session, _cleanup_rejected=False)
+        return "Could not prepare Blender for Mario: {}".format(exc)
+
+    try:
+        session.library = _load_native_library()
+        session.library_loaded = True
+        sm64 = session.library
+        _lifecycle_log(session, "library loaded")
+        _configure_native_api(session.library)
+
+        rom_chars = ct.c_ubyte * len(rom_bytes)
         texture_buff = (ct.c_ubyte * (4 * SM64_TEXTURE_WIDTH * SM64_TEXTURE_HEIGHT))()
-        sm64.sm64_global_init(rom_chars.from_buffer(rom_bytes), texture_buff, None)
+        session.global_init_attempted = True
+        _lifecycle_log(session, "global init started")
+        session.library.sm64_global_init(rom_chars.from_buffer(rom_bytes), texture_buff, None)
+        session.global_initialized = True
+        _lifecycle_log(session, "global init succeeded")
         initialize_all_data(texture_buff)
 
-    (surface_array, surface_array_len) = get_surface_array_from_scene()
+        (surface_array, surface_array_len) = get_surface_array_from_scene()
+        session.library.sm64_static_surfaces_load(surface_array, surface_array_len)
 
-    sm64.sm64_static_surfaces_load(surface_array, surface_array_len)
+        session.mario_create_attempted = True
+        _lifecycle_log(session, "Mario create started")
+        mario_id = int(session.library.sm64_mario_create(0, 0, 0))
+        if mario_id < 0:
+            _lifecycle_log(session, "Mario create failed")
+            raise MarioLifecycleError("There is no ground under the 3D cursor where Mario can spawn")
+        session.mario_id = mario_id
+        session.mario_created = True
+        sm64_mario_id = mario_id
+        _lifecycle_log(session, "Mario create succeeded")
 
-    sm64_mario_id = sm64.sm64_mario_create(0, 0, 0)
+        session.live_object = _create_live_object()
+        session.live_object_name = session.live_object.name
+        session.live_object["libsm64_session_owner"] = session.owner_token
+        session.live_object["libsm64_session_generation"] = session.generation
+        start_input_reader()
+        session.input_started = True
 
-    if sm64_mario_id < 0:
-        sm64.sm64_global_terminate()
-        sm64 = None
-        return "There is no ground under the 3D cursor where mario will spawn"
+        simulation_scene = bpy.context.scene
+        session.scene = simulation_scene
+        original_fps_setting = simulation_scene.render.fps
+        original_fps_base = simulation_scene.render.fps_base
+        original_fps = float(original_fps_setting) / float(original_fps_base)
+        simulation_scene.render.fps = 30
+        simulation_scene.render.fps_base = 1.0
+        _start_blender_playback()
+        _install_tick_handler(session)
 
-    mario_obj = bpy.data.objects.new('LibSM64 Mario', bpy.data.meshes['libsm64_mario_mesh'])
-    bpy.context.scene.collection.objects.link(mario_obj)
+        tick_count = 0
+        session.session_committed = True
+        return None
+    except Exception as exc:
+        if session.global_init_attempted and not session.global_initialized:
+            _lifecycle_log(session, "global init failed")
+        stop_tick_mario(_session=session, _cleanup_rejected=False)
+        if isinstance(exc, MarioLifecycleError):
+            return str(exc)
+        return "Could not initialize Mario: {}".format(exc)
 
-    start_input_reader()
 
-    simulation_scene = bpy.context.scene
-    original_fps_setting = simulation_scene.render.fps
-    original_fps_base = simulation_scene.render.fps_base
-    original_fps = float(original_fps_setting) / float(original_fps_base)
-    simulation_scene.render.fps = 30
-    simulation_scene.render.fps_base = 1.0
-    bpy.ops.screen.animation_play()
-    remove_tick_mario_handlers()
-    bpy.app.handlers.frame_change_pre.append(tick_mario)
-
-    tick_count = 0
-
-    return None
-
-def remove_tick_mario_handlers():
-    """Remove this add-on's callbacks, including stale copies after reload."""
+def remove_tick_mario_handlers(session=None):
+    """Remove only callbacks owned by one explicit lifecycle generation."""
+    session = session or _lifecycle
     handlers = bpy.app.handlers.frame_change_pre
     removed = 0
     for handler in list(handlers):
-        if (handler is tick_mario or
-                (getattr(handler, '__module__', None) == __name__ and
-                 getattr(handler, '__name__', None) == 'tick_mario')):
+        if (
+            handler is session.tick_handler
+            or (
+                getattr(handler, '_libsm64_owner_token', None) == session.owner_token
+                and getattr(handler, '_libsm64_generation', None) == session.generation
+            )
+        ):
             handlers.remove(handler)
             removed += 1
+    if removed or session.tick_handler_installed:
+        _lifecycle_log(session, "tick removed")
+    session.tick_handler_installed = False
     return removed
 
 
+def get_live_mario_object():
+    """Return only the stable live-role object, with an exact-name legacy fallback."""
+    for obj in bpy.data.objects:
+        if obj.get(LIVE_ROLE) == LIVE_ROLE_VALUE and not obj.get('libsm64_is_bake', False):
+            return obj
+    legacy = bpy.data.objects.get('LibSM64 Mario')
+    if legacy is not None and not legacy.get('libsm64_is_bake', False):
+        return legacy
+    return None
+
+
+def _ensure_live_mesh_exclusive(live_object):
+    """Detach Live Mario before simulation writes if any object shares its mesh."""
+    mesh = live_object.data
+    if mesh.users <= 1:
+        return mesh
+    exclusive = mesh.copy()
+    exclusive.name = "libsm64_mario_live_mesh"
+    live_object.data = exclusive
+    if exclusive.users != 1:
+        raise RuntimeError("Could not make the Live Mario mesh exclusive")
+    copied_keys = getattr(exclusive, "shape_keys", None)
+    if copied_keys is not None:
+        if copied_keys is getattr(mesh, "shape_keys", None) or copied_keys.users != 1:
+            raise RuntimeError("Could not detach Live Mario's shape keys")
+        live_object.shape_key_clear()
+    return exclusive
+
+
 def is_mario_running():
-    return sm64 is not None and sm64_mario_id >= 0 and 'LibSM64 Mario' in bpy.data.objects
+    session = _lifecycle
+    return bool(
+        _session_is_registered_owner(session)
+        and session.session_committed
+        and session.library_loaded
+        and session.global_initialized
+        and session.mario_created
+        and session.mario_id >= 0
+        and not session.shutdown_in_progress
+        and not session.shutdown_complete
+        and get_live_mario_object() is not None
+    )
 
 
 def get_simulation_target_fps(scene=None):
-    if sm64 is not None and original_fps > 0:
+    if is_mario_running() and original_fps > 0:
         return float(original_fps)
     scene = scene or bpy.context.scene
     return float(scene.render.fps) / float(scene.render.fps_base)
 
 
-def stop_tick_mario():
+def capture_mario_starting_mark():
+    """Capture the public simulation state needed for a safe fresh Mario spawn."""
+    if not is_mario_running():
+        raise RuntimeError("Live Mario is unavailable")
+    return {
+        "position": (
+            float(mario_state.posX),
+            float(mario_state.posY),
+            float(mario_state.posZ),
+        ),
+        "velocity": (
+            float(mario_state.velX),
+            float(mario_state.velY),
+            float(mario_state.velZ),
+        ),
+        "face_angle": float(mario_state.faceAngle),
+        "health": int(mario_state.health),
+    }
+
+
+def restore_mario_starting_mark(mark):
+    """Recreate libsm64 Mario at a mark, clearing all transient internal state.
+
+    The bundled libsm64 exposes create/delete but no complete state setter. A
+    fresh instance is therefore safer than moving only Blender geometry or
+    attempting to mutate the output state structure.
+    """
+    global sm64_mario_id, tick_count
+
+    session = _lifecycle
+    if not is_mario_running():
+        raise RuntimeError("Live Mario is unavailable")
+    position = mark["position"]
+    spawn = tuple(max(-32768, min(32767, int(round(value)))) for value in position)
+    old_id = session.mario_id
+    session.library.sm64_mario_delete(old_id)
+    session.mario_created = False
+    session.mario_id = -1
+    sm64_mario_id = -1
+    replacement_id = int(session.library.sm64_mario_create(*spawn))
+    if replacement_id < 0:
+        raise RuntimeError("Could not restore Live Mario at the starting mark")
+    session.mario_id = replacement_id
+    session.mario_created = True
+    sm64_mario_id = replacement_id
+
+    for field in (
+        "camLookX", "camLookZ", "stickX", "stickY",
+        "buttonA", "buttonB", "buttonZ",
+    ):
+        setattr(mario_inputs, field, 0)
+    session.library.sm64_mario_tick(
+        session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
+    )
+    tick_count = 1
+
+    live_object = get_live_mario_object()
+    if live_object is not None:
+        update_mesh_data(_ensure_live_mesh_exclusive(live_object))
+        live_object.hide_render = False
+        try:
+            live_object.hide_set(False)
+        except AttributeError:
+            live_object.hide_viewport = False
+    return sm64_mario_id
+
+
+def resume_mario_for_recording():
+    """Run libsm64 at its fixed 30 Hz while preserving the output FPS target."""
+    if not is_mario_running():
+        raise RuntimeError("Live Mario is unavailable")
+    scene = simulation_scene or bpy.context.scene
+    scene.render.fps = 30
+    scene.render.fps_base = 1.0
+    _install_tick_handler(_lifecycle)
+    screen = getattr(bpy.context, "screen", None)
+    if screen is None or not getattr(screen, "is_animation_playing", False):
+        _start_blender_playback()
+
+
+def pause_mario_for_review():
+    """Pause simulation and restore Blender's FPS for timeline review."""
+    remove_tick_mario_handlers()
+    scene = simulation_scene
+    if scene is not None and original_fps_setting > 0:
+        scene.render.fps = original_fps_setting
+        scene.render.fps_base = original_fps_base
+    _cancel_blender_playback()
+
+
+def stop_tick_mario(_session=None, _cleanup_rejected=True):
+    """Idempotently tear down only native resources this generation owns."""
     global sm64, sm64_mario_id, original_fps, original_fps_setting
     global original_fps_base, original_cursor_pos, simulation_scene
 
-    removed_handlers = remove_tick_mario_handlers()
-    scene = simulation_scene
-    was_running = sm64 is not None or scene is not None or removed_handlers > 0
+    session = _session or _lifecycle
+    if session.shutdown_in_progress:
+        _lifecycle_log(session, "shutdown already in progress")
+        return ()
+    if session.shutdown_complete:
+        _lifecycle_log(session, "shutdown already complete")
+        return ()
+    if not _session_is_registered_owner(session):
+        _lifecycle_log(session, "shutdown skipped: session is not owned by this generation")
+        return ()
+
+    session.shutdown_in_progress = True
+    errors = []
+    scene = session.scene or simulation_scene
+    was_running = session.session_committed
+    remove_tick_mario_handlers(session)
     if scene is not None:
         if original_fps_setting > 0:
             scene.render.fps = original_fps_setting
@@ -207,30 +594,99 @@ def stop_tick_mario():
             original_cursor_pos[2]
         )
     if was_running:
-        try:
-            bpy.ops.screen.animation_cancel()
-        except (RuntimeError, AttributeError):
-            pass
-    active_library = sm64
-    sm64_mario_id = -1
-    sm64 = None
-    original_fps = 0
-    original_fps_setting = 0
-    original_fps_base = 1.0
-    simulation_scene = None
+        _cancel_blender_playback()
     try:
-        if active_library is not None:
-            active_library.sm64_global_terminate()
-    finally:
-        stop_input_reader()
+        if session.mario_created and not session.mario_delete_attempted:
+            if not (session.library_loaded and session.global_initialized and session.library):
+                errors.append("Mario state is inconsistent; native delete skipped")
+                _lifecycle_log(session, "Mario delete skipped: lifecycle prerequisites are not valid")
+            else:
+                session.mario_delete_attempted = True
+                _lifecycle_log(session, "Mario delete invoked")
+                try:
+                    session.library.sm64_mario_delete(session.mario_id)
+                    session.mario_created = False
+                    session.mario_id = -1
+                except Exception as exc:
+                    errors.append("Mario delete failed: {}".format(exc))
+        elif session.mario_created:
+            _lifecycle_log(session, "Mario delete skipped: deletion was already attempted")
+        else:
+            _lifecycle_log(session, "Mario delete skipped: no Mario instance was created")
 
-def tick_mario(scene, depsgraph=None):
+        if session.global_initialized and not session.global_terminate_attempted:
+            if session.mario_created:
+                errors.append("Global termination skipped because Mario deletion did not complete")
+                _lifecycle_log(session, "global terminate skipped: Mario instance may still be active")
+            elif not (session.library_loaded and session.library):
+                errors.append("Global state is inconsistent; native terminate skipped")
+                _lifecycle_log(session, "global terminate skipped: library ownership is invalid")
+            else:
+                session.global_terminate_attempted = True
+                _lifecycle_log(session, "global terminate invoked")
+                try:
+                    session.library.sm64_global_terminate()
+                    session.global_initialized = False
+                except Exception as exc:
+                    errors.append("Global termination failed: {}".format(exc))
+        elif session.global_initialized:
+            _lifecycle_log(session, "global terminate skipped: termination was already attempted")
+        else:
+            _lifecycle_log(
+                session,
+                "Skipping sm64_global_terminate: global initialization was not successfully completed.",
+            )
+    finally:
+        if session.input_started:
+            try:
+                stop_input_reader()
+            except Exception as exc:
+                errors.append("Input cleanup failed: {}".format(exc))
+            session.input_started = False
+        live_object = bpy.data.objects.get(session.live_object_name) if session.live_object_name else None
+        if (
+            live_object is not None
+            and live_object.get("libsm64_session_owner") == session.owner_token
+            and int(live_object.get("libsm64_session_generation", -1)) == session.generation
+        ):
+            bpy.data.objects.remove(live_object, do_unlink=True)
+        session.live_object = None
+        session.live_object_name = ""
+        session.library = None
+        session.library_loaded = False
+        session.session_committed = False
+        session.shutdown_in_progress = False
+        session.shutdown_complete = True
+        sm64_mario_id = -1
+        sm64 = None
+        original_fps = 0
+        original_fps_setting = 0
+        original_fps_base = 1.0
+        simulation_scene = None
+        if errors:
+            _lifecycle_log(session, "shutdown completed with errors; lifecycle is poisoned")
+        else:
+            _release_session(session)
+            _lifecycle_log(session, "shutdown completed")
+    if was_running and _cleanup_rejected:
+        # Import lazily to keep take management out of the simulation module's
+        # import path and make this the single live-control cleanup boundary.
+        from .take_manager import cleanup_rejected
+        cleanup_rejected(scene or bpy.context.scene)
+    return tuple(errors)
+
+def tick_mario(scene, depsgraph=None, _session=None):
     global sm64, sm64_mario_id, mario_state, mario_geo, tick_count, last_cam_change_tick, origin_offset, follow_cam
 
-    if not ('LibSM64 Mario' in bpy.data.objects):
+    session = _session or _lifecycle
+    if not _session_is_registered_owner(session) or not session.mario_created:
+        return 0
+
+    live_object = get_live_mario_object()
+    if live_object is None:
         if recorder.active:
             recorder.fail("Live Mario was deleted; recording cancelled", preserve_samples=False)
-        stop_tick_mario()
+        stop_tick_mario(_session=session)
         return 0
 
     sample_input_reader(mario_inputs)
@@ -263,7 +719,9 @@ def tick_mario(scene, depsgraph=None):
     mario_inputs.camLookX = look_dir.x
     mario_inputs.camLookZ = -look_dir.y
 
-    sm64.sm64_mario_tick(sm64_mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo))
+    session.library.sm64_mario_tick(
+        session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
+    )
 
     if follow_cam:
         bpy.context.scene.cursor.location = (
@@ -276,13 +734,14 @@ def tick_mario(scene, depsgraph=None):
             with bpy.context.temp_override(area=view3d, region=region):
                 bpy.ops.view3d.view_center_cursor()
 
+    live_mesh = _ensure_live_mesh_exclusive(live_object)
     if tick_count < 15: # This is enough frames to get Mario to open his eyes, then we'll stop updating uv/color
-        update_mesh_data(bpy.data.meshes['libsm64_mario_mesh'])
+        update_mesh_data(live_mesh)
     else:
-        update_mesh_data_fast(bpy.data.meshes['libsm64_mario_mesh'])
+        update_mesh_data_fast(live_mesh)
 
     try:
-        recorder.capture_mesh(bpy.data.meshes['libsm64_mario_mesh'], tick_count)
+        recorder.capture_mesh(live_mesh, tick_count)
     except Exception as exc:
         recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
     tick_count += 1

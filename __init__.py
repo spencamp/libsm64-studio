@@ -3,21 +3,129 @@ bl_info = {
     "author" : "libsm64",
     "description" : "Add a playble Mario to your Blender Scene",
     "blender" : (2, 80, 0),
-    "version" : (2, 1, 0),
+    "version" : (2, 2, 2),
     "location" : "View3D",
     "warning" : "",
     "category" : "Generic"
 }
 
 import bpy
+import atexit
+import math
 import platform
+from bpy.app.handlers import persistent
 from . mario import (
+    capture_mario_starting_mark,
     get_simulation_target_fps,
+    get_live_mario_object,
     insert_mario,
     is_mario_running,
+    pause_mario_for_review,
+    restore_mario_starting_mark,
+    resume_mario_for_recording,
     stop_tick_mario,
 )
-from . recording import RecordingError, bake_shape_keys, recorder
+from . recording import (
+    RecordingError,
+    bake_shape_keys,
+    discard_baked_take,
+    recorder,
+    sample_target_frame,
+)
+from .take_manager import (
+    FAVORITE,
+    REGULAR,
+    REJECTED,
+    TAKE_DISPOSITION,
+    TAKE_ID,
+    SCENE_SCHEMA_VERSION,
+    TAKE_SCHEMA_VERSION,
+    TakeError,
+    current_take,
+    favorite_take,
+    find_take,
+    iter_takes,
+    reconcile_scene,
+    register_baked_take,
+    reject_take,
+    restore_take,
+    select_take,
+    take_label,
+    unfavorite_take,
+)
+
+
+_recording_start_mark = None
+_confirmation_message = ""
+BUILD_ID = "2.2.2+native-lifecycle"
+
+
+def _addon_preferences(context):
+    """Return this add-on's preferences without assuming registration finished."""
+    preferences = getattr(context, "preferences", None)
+    addons = getattr(preferences, "addons", None)
+    if addons is None:
+        return None
+    entry = addons.get(__package__)
+    return getattr(entry, "preferences", None)
+
+
+def _ensure_scene_take_state(context):
+    """Explicitly migrate one scene from a safe operator/load context."""
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return None
+    if int(scene.get(SCENE_SCHEMA_VERSION, 0)) < TAKE_SCHEMA_VERSION:
+        reconcile_scene(scene)
+    return scene
+
+
+def _migrate_all_scenes_once():
+    for scene in bpy.data.scenes:
+        if int(scene.get(SCENE_SCHEMA_VERSION, 0)) < TAKE_SCHEMA_VERSION:
+            reconcile_scene(scene)
+    print("libsm64 Studio build {} loaded".format(BUILD_ID))
+    return None
+
+
+@persistent
+def _migrate_take_state_on_load(_unused):
+    _migrate_all_scenes_once()
+
+
+@persistent
+def _shutdown_native_session_on_load_pre(_unused):
+    stop_tick_mario()
+
+
+def _shutdown_owned_session_at_exit():
+    try:
+        stop_tick_mario()
+    except Exception as exc:
+        print("libsm64 lifecycle exit cleanup failed: {}".format(exc))
+
+
+def _redraw_panels():
+    for window in getattr(bpy.context.window_manager, "windows", ()):
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def _clear_confirmation():
+    global _confirmation_message
+    _confirmation_message = ""
+    _redraw_panels()
+    return None
+
+
+def _show_confirmation(message):
+    global _confirmation_message
+    _confirmation_message = message
+    if bpy.app.timers.is_registered(_clear_confirmation):
+        bpy.app.timers.unregister(_clear_confirmation)
+    bpy.app.timers.register(_clear_confirmation, first_interval=2.0)
+    _redraw_panels()
 
 class LibSm64Properties(bpy.types.PropertyGroup):
     camera_follow : bpy.props.BoolProperty (
@@ -39,6 +147,10 @@ class LibSm64Properties(bpy.types.PropertyGroup):
     mario_scale : bpy.props.FloatProperty(
         name="Blender to SM64 Scale",
         default=100
+    )
+    rejected_expanded : bpy.props.BoolProperty(
+        name="Show rejected takes",
+        default=False,
     )
 
 class LibSm64Preferences(bpy.types.AddonPreferences):
@@ -64,39 +176,133 @@ class Main_PT_Panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        scene = context.scene
-        preferences = context.preferences.addons[__package__].preferences
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "libsm64", None) if scene is not None else None
+        preferences = _addon_preferences(context)
+        if scene is None or settings is None:
+            layout.label(text="LibSM64 is still initializing", icon='INFO')
+            return
 
         col = layout.column()
-        prop_split(col, scene.libsm64, "mario_scale", "Blender to SM64 Scale")
-        col.prop(preferences, "rom_path")
-        col.prop(scene.libsm64, "camera_follow")
-        col.operator(InsertMario_OT_Operator.bl_idname, text='Insert Mario')
-        col.prop(scene.libsm64, "camera_shift")
+        prop_split(col, settings, "mario_scale", "Blender to SM64 Scale")
+        if preferences is not None:
+            col.prop(preferences, "rom_path")
+        else:
+            col.label(text="Add-on preferences unavailable", icon='INFO')
+        col.prop(settings, "camera_follow")
+        insert_row = col.row()
+        insert_row.enabled = preferences is not None
+        insert_row.operator(InsertMario_OT_Operator.bl_idname, text='Insert Mario')
+        col.prop(settings, "camera_shift")
         col.operator(ControlMario_OT_Operator.bl_idname, text='Control Mario with keyboard')
         col.label(text="WASD + JKL to move. ESC to stop.")
 
         layout.separator()
         box = layout.box()
-        box.label(text="Animation Recording")
-        box.label(text="Status: {}".format(recorder.status))
-        box.label(text="Samples: {}".format(recorder.sample_count))
-        box.label(text="Duration: {:.2f} seconds".format(recorder.duration_seconds))
-        if recorder.message:
-            box.label(text=recorder.message, icon='INFO')
+        box.label(text="Performance Recording")
+        box.label(text="Build {}".format(BUILD_ID))
+        if recorder.active:
+            box.label(text="Live Mario: Recording", icon='REC')
+        elif is_mario_running():
+            box.label(text="Live Mario: Ready", icon='CHECKMARK')
+        else:
+            box.label(text="Live Mario: Unavailable", icon='ERROR')
+
+        primary = box.row()
+        primary.scale_y = 1.6
+        if recorder.active or recorder.has_pending_samples:
+            primary.enabled = recorder.has_pending_samples or recorder.active
+            primary.operator(StopAndBake_OT_Operator.bl_idname, text="Stop & Bake", icon='KEY_HLT')
+        else:
+            primary.enabled = is_mario_running()
+            primary.operator(StartRecording_OT_Operator.bl_idname, text="Start Recording", icon='REC')
+        if recorder.active or recorder.has_pending_samples:
+            box.operator(CancelRecording_OT_Operator.bl_idname, text="Cancel Recording", icon='CANCEL')
+
+        if recorder.active:
+            box.label(text="{} samples · {:.2f} seconds".format(
+                recorder.sample_count, recorder.duration_seconds
+            ))
         if recorder.sample_count >= 300:
             box.label(text="Large take: shape-key baking may take time", icon='ERROR')
-        else:
-            box.label(text="Designed for short takes (about 10 seconds or less)")
-        box.label(text="Bake captures positions; UV/color changes are not recorded")
+        if _confirmation_message:
+            box.label(text=_confirmation_message, icon='CHECKMARK')
+        end_row = box.row()
+        end_row.enabled = is_mario_running()
+        end_row.operator(EndMarioControl_OT_Operator.bl_idname, text="End Mario Control")
 
-        row = box.row(align=True)
-        row.enabled = is_mario_running() and not recorder.active
-        row.operator(StartRecording_OT_Operator.bl_idname, text="Start Recording", icon='REC')
-        row = box.row(align=True)
-        row.enabled = recorder.active or recorder.has_pending_samples
-        row.operator(StopAndBake_OT_Operator.bl_idname, text="Stop & Bake", icon='KEY_HLT')
-        row.operator(CancelRecording_OT_Operator.bl_idname, text="Cancel", icon='CANCEL')
+        takes = iter_takes()
+        current = current_take(scene)
+
+        layout.separator()
+        layout.label(text="Current")
+        if current is None:
+            layout.label(text="No current take")
+        else:
+            draw_take_row(layout, current, is_current=True)
+
+        favorites = sorted(
+            (obj for obj in takes if obj.get(TAKE_DISPOSITION) == FAVORITE),
+            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+        )
+        layout.separator()
+        layout.label(text="Favorites")
+        if favorites:
+            for obj in favorites:
+                draw_take_row(layout, obj, is_current=(obj is current))
+        else:
+            layout.label(text="No favorites")
+
+        regular = sorted(
+            (obj for obj in takes
+             if obj.get(TAKE_DISPOSITION) == REGULAR and obj is not current),
+            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+        )
+        layout.separator()
+        layout.label(text="Takes")
+        if regular:
+            for obj in regular:
+                draw_take_row(layout, obj)
+        else:
+            layout.label(text="No other takes")
+
+        rejected = sorted(
+            (obj for obj in takes if obj.get(TAKE_DISPOSITION) == REJECTED),
+            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+        )
+        layout.separator()
+        row = layout.row()
+        icon = 'TRIA_DOWN' if settings.rejected_expanded else 'TRIA_RIGHT'
+        row.prop(
+            settings, "rejected_expanded",
+            text="Rejected ({})".format(len(rejected)), icon=icon, emboss=False,
+        )
+        if settings.rejected_expanded:
+            for obj in rejected:
+                rejected_row = layout.row(align=True)
+                rejected_row.label(text=take_label(obj))
+                op = rejected_row.operator(RestoreTake_OT_Operator.bl_idname, text="Restore")
+                op.take_id = obj[TAKE_ID]
+
+
+def draw_take_row(layout, obj, is_current=False):
+    row = layout.row(align=True)
+    op = row.operator(
+        SelectTake_OT_Operator.bl_idname,
+        text=take_label(obj),
+        depress=is_current,
+    )
+    op.take_id = obj[TAKE_ID]
+    favorite = obj.get(TAKE_DISPOSITION) == FAVORITE
+    op = row.operator(
+        ToggleFavoriteTake_OT_Operator.bl_idname,
+        text="", icon='SOLO_ON' if favorite else 'SOLO_OFF',
+    )
+    op.take_id = obj[TAKE_ID]
+    reject_row = row.row(align=True)
+    reject_row.enabled = not favorite
+    reject = reject_row.operator(RejectTake_OT_Operator.bl_idname, text="", icon='X')
+    reject.take_id = obj[TAKE_ID]
 
 class InsertMario_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_insert_mario"
@@ -105,7 +311,10 @@ class InsertMario_OT_Operator(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        preferences = context.preferences.addons[__package__].preferences
+        preferences = _addon_preferences(context)
+        if preferences is None:
+            self.report({"ERROR"}, "LibSM64 add-on preferences are unavailable")
+            return {'CANCELLED'}
         err = insert_mario(preferences.rom_path, scene.libsm64.mario_scale, scene.libsm64.camera_follow)
         if err != None:
             self.report({"ERROR"}, err)
@@ -144,15 +353,21 @@ class StartRecording_OT_Operator(bpy.types.Operator):
     bl_description = "Capture one complete Mario mesh snapshot per libsm64 tick"
 
     def execute(self, context):
+        global _recording_start_mark
         if not is_mario_running():
             self.report({'ERROR'}, "Insert Mario and keep the simulation running first")
             return {'CANCELLED'}
         try:
+            _recording_start_mark = capture_mario_starting_mark()
+            resume_mario_for_recording()
             recorder.start(
                 float(context.scene.frame_current),
                 get_simulation_target_fps(context.scene),
             )
         except Exception as exc:
+            _recording_start_mark = None
+            if is_mario_running():
+                pause_mario_for_review()
             recorder.fail("Could not start recording: {}".format(exc), preserve_samples=False)
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
@@ -168,30 +383,71 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
     )
 
     def execute(self, context):
-        source_object = bpy.data.objects.get('LibSM64 Mario')
+        global _recording_start_mark
+        source_object = get_live_mario_object()
         try:
             samples = recorder.freeze_for_bake()
         except RecordingError as exc:
+            try:
+                pause_mario_for_review()
+            except Exception:
+                pass
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
         start_frame = recorder.start_frame
         target_fps = recorder.target_fps
+        baked_object = None
         try:
-            stop_tick_mario()
             baked_object = bake_shape_keys(
                 context, source_object, samples, start_frame, target_fps
             )
+            take_number = register_baked_take(context.scene, baked_object)
         except Exception as exc:
+            if baked_object is not None:
+                discard_baked_take(baked_object)
+            try:
+                pause_mario_for_review()
+            except Exception:
+                pass
             recorder.fail("Bake failed: {}".format(exc), preserve_samples=True)
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
 
+        final_frame = sample_target_frame(start_frame, len(samples) - 1, target_fps)
+        if final_frame > context.scene.frame_end:
+            context.scene.frame_end = int(math.ceil(final_frame))
+        try:
+            select_take(context, baked_object)
+        except (TakeError, RuntimeError):
+            # The take is already committed and may be outside the active view
+            # layer; selection is convenience, not part of data ownership.
+            pass
+
         sample_count = len(samples)
-        recorder.complete(baked_object.name)
+        label = "Take {:03d}".format(take_number)
+        recorder.complete(label)
+        try:
+            if _recording_start_mark is None:
+                raise RuntimeError("The recording starting mark is unavailable")
+            restore_mario_starting_mark(_recording_start_mark)
+            pause_mario_for_review()
+        except Exception as exc:
+            try:
+                pause_mario_for_review()
+            except Exception:
+                pass
+            _recording_start_mark = None
+            self.report(
+                {'ERROR'},
+                "{} was captured, but Live Mario reset failed: {}".format(label, exc),
+            )
+            return {'FINISHED'}
+        _recording_start_mark = None
+        _show_confirmation("✓ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
-            "Baked {} Mario samples to {}".format(sample_count, baked_object.name),
+            "Baked {} Mario samples to {}".format(sample_count, label),
         )
         return {'FINISHED'}
 
@@ -202,8 +458,113 @@ class CancelRecording_OT_Operator(bpy.types.Operator):
     bl_description = "Discard the pending take without stopping the live Mario simulation"
 
     def execute(self, context):
+        global _recording_start_mark
+        mark = _recording_start_mark
         recorder.cancel()
+        _recording_start_mark = None
+        if mark is not None and is_mario_running():
+            try:
+                restore_mario_starting_mark(mark)
+            except Exception as exc:
+                self.report({'ERROR'}, "Recording discarded, but Mario reset failed: {}".format(exc))
+            finally:
+                pause_mario_for_review()
         self.report({'INFO'}, "Mario recording discarded")
+        return {'FINISHED'}
+
+
+class SelectTake_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_select_take"
+    bl_label = "Select Take"
+    bl_description = "Make this the current visible take without changing the timeline"
+
+    take_id : bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = find_take(self.take_id)
+        if obj is None:
+            self.report({'ERROR'}, "Take not found")
+            return {'CANCELLED'}
+        try:
+            select_take(context, obj)
+        except TakeError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ToggleFavoriteTake_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_toggle_favorite_take"
+    bl_label = "Favorite Take"
+    bl_description = "Keep this take visible, or return it to regular visibility"
+
+    take_id : bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = find_take(self.take_id)
+        if obj is None:
+            self.report({'ERROR'}, "Take not found")
+            return {'CANCELLED'}
+        try:
+            if obj.get(TAKE_DISPOSITION) == FAVORITE:
+                unfavorite_take(context.scene, obj)
+            else:
+                favorite_take(context.scene, obj)
+        except TakeError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class RejectTake_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_reject_take"
+    bl_label = "Reject Take"
+    bl_description = "Hide this take and keep it until Mario control ends"
+
+    take_id : bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = find_take(self.take_id)
+        if obj is None:
+            self.report({'ERROR'}, "Take not found")
+            return {'CANCELLED'}
+        try:
+            reject_take(context.scene, obj)
+        except TakeError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class RestoreTake_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_restore_take"
+    bl_label = "Restore Take"
+
+    take_id : bpy.props.StringProperty()
+
+    def execute(self, context):
+        obj = find_take(self.take_id)
+        if obj is None:
+            self.report({'ERROR'}, "Take not found")
+            return {'CANCELLED'}
+        restore_take(context, obj)
+        return {'FINISHED'}
+
+
+class EndMarioControl_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_end_mario_control"
+    bl_label = "End Mario Control"
+    bl_description = "End live control and permanently remove all rejected takes"
+
+    def execute(self, context):
+        global _recording_start_mark
+        recorder.cancel("Mario control ended")
+        _recording_start_mark = None
+        stop_tick_mario()
+        live_object = get_live_mario_object()
+        if live_object is not None:
+            bpy.data.objects.remove(live_object, do_unlink=True)
+        self.report({'INFO'}, "Mario control ended; rejected takes cleaned up")
         return {'FINISHED'}
 
 config = {
@@ -248,17 +609,44 @@ register_classes, unregister_classes = bpy.utils.register_classes_factory((
     StartRecording_OT_Operator,
     StopAndBake_OT_Operator,
     CancelRecording_OT_Operator,
+    SelectTake_OT_Operator,
+    ToggleFavoriteTake_OT_Operator,
+    RejectTake_OT_Operator,
+    RestoreTake_OT_Operator,
+    EndMarioControl_OT_Operator,
 ))
 
 def register():
     register_classes()
     bpy.types.Scene.libsm64 = bpy.props.PointerProperty(type=LibSm64Properties)
+    handlers = bpy.app.handlers.load_post
+    if _migrate_take_state_on_load not in handlers:
+        handlers.append(_migrate_take_state_on_load)
+    if not bpy.app.timers.is_registered(_migrate_all_scenes_once):
+        bpy.app.timers.register(_migrate_all_scenes_once, first_interval=0.0)
+    if _shutdown_native_session_on_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_shutdown_native_session_on_load_pre)
+    atexit.unregister(_shutdown_owned_session_at_exit)
+    atexit.register(_shutdown_owned_session_at_exit)
 
 def unregister():
+    global _recording_start_mark, _confirmation_message
     recorder.cancel("Add-on unregistered")
+    _recording_start_mark = None
+    _confirmation_message = ""
+    if bpy.app.timers.is_registered(_clear_confirmation):
+        bpy.app.timers.unregister(_clear_confirmation)
+    if bpy.app.timers.is_registered(_migrate_all_scenes_once):
+        bpy.app.timers.unregister(_migrate_all_scenes_once)
+    if _migrate_take_state_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_migrate_take_state_on_load)
+    if _shutdown_native_session_on_load_pre in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_shutdown_native_session_on_load_pre)
+    atexit.unregister(_shutdown_owned_session_at_exit)
     stop_tick_mario()
     unregister_classes()
-    del bpy.types.Scene.libsm64
+    if hasattr(bpy.types.Scene, "libsm64"):
+        del bpy.types.Scene.libsm64
 
 def prop_split(layout, data, field, name):
     split = layout.split(factor = 0.5)

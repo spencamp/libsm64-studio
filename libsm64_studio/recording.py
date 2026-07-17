@@ -6,7 +6,6 @@ behind :func:`bake_shape_keys`.
 """
 
 from array import array
-import math
 
 
 SAMPLE_FPS = 30.0
@@ -153,15 +152,6 @@ def _copy_object_display_settings(source, destination):
                 pass
 
 
-def _set_scene_frame(scene, frame):
-    whole = int(math.floor(frame))
-    subframe = float(frame) - whole
-    try:
-        scene.frame_set(whole, subframe=subframe)
-    except TypeError:
-        scene.frame_set(whole)
-
-
 def iter_action_fcurves(action):
     """Yield curves from legacy actions and Blender 4.4+ layered actions."""
     legacy_fcurves = getattr(action, "fcurves", None)
@@ -175,6 +165,70 @@ def iter_action_fcurves(action):
             for channelbag in getattr(strip, "channelbags", ()):
                 for fcurve in channelbag.fcurves:
                     yield fcurve
+
+
+def _remove_take_datablocks(baked_object, baked_mesh=None, action=None):
+    """Remove a partial take and only the datablocks created for that take."""
+    import bpy
+
+    if baked_object is not None and bpy.data.objects.get(baked_object.name) is baked_object:
+        bpy.data.objects.remove(baked_object, do_unlink=True)
+    if action is not None and action.users == 0 and bpy.data.actions.get(action.name) is action:
+        bpy.data.actions.remove(action)
+    if baked_mesh is not None and baked_mesh.users == 0 and bpy.data.meshes.get(baked_mesh.name) is baked_mesh:
+        bpy.data.meshes.remove(baked_mesh)
+
+
+def discard_baked_take(baked_object):
+    """Roll back a fully built but uncommitted baked take."""
+    mesh = getattr(baked_object, "data", None)
+    key_data = getattr(mesh, "shape_keys", None) if mesh is not None else None
+    animation_data = getattr(key_data, "animation_data", None)
+    action = getattr(animation_data, "action", None)
+    _remove_take_datablocks(baked_object, mesh, action)
+
+
+def validate_take_ownership(baked_object, source_object=None):
+    """Prove that a bake exclusively owns every mutable animation datablock."""
+    import bpy
+
+    if baked_object is None or getattr(baked_object, "type", None) != 'MESH':
+        raise RecordingError("The baked take object is unavailable")
+    mesh = baked_object.data
+    key_data = getattr(mesh, "shape_keys", None)
+    animation_data = getattr(key_data, "animation_data", None)
+    action = getattr(animation_data, "action", None)
+    if source_object is not None:
+        if baked_object is source_object:
+            raise RecordingError("The baked take reused Live Mario's object")
+        if mesh is source_object.data:
+            raise RecordingError("The baked take reused Live Mario's mesh")
+        if key_data is not None and key_data is getattr(source_object.data, "shape_keys", None):
+            raise RecordingError("The baked take reused Live Mario's shape keys")
+    if mesh.users != 1:
+        raise RecordingError("The baked take mesh has {} users; expected 1".format(mesh.users))
+    if key_data is None:
+        raise RecordingError("The baked take has no shape-key datablock")
+    if key_data.users != 1:
+        raise RecordingError(
+            "The baked take shape-key datablock has {} users; expected 1".format(key_data.users)
+        )
+    if action is None:
+        raise RecordingError("The baked take has no shape-key action")
+    if action.users != 1:
+        raise RecordingError("The baked take action has {} users; expected 1".format(action.users))
+
+    for other in bpy.data.objects:
+        if other is not baked_object and getattr(other, "data", None) is mesh:
+            raise RecordingError("Another object shares the baked take mesh")
+        other_mesh = getattr(other, "data", None)
+        other_keys = getattr(other_mesh, "shape_keys", None)
+        if other is not baked_object and other_keys is key_data:
+            raise RecordingError("Another object shares the baked take shape keys")
+        other_animation = getattr(other_keys, "animation_data", None)
+        if other is not baked_object and getattr(other_animation, "action", None) is action:
+            raise RecordingError("Another object shares the baked take action")
+    return mesh, key_data, action
 
 
 def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
@@ -196,26 +250,29 @@ def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
                 )
             )
 
-    baked_mesh = source_object.data.copy()
+    source_mesh = source_object.data
+    baked_mesh = source_mesh.copy()
     baked_mesh.name = "LibSM64 Mario Bake Mesh"
-    baked_mesh_name = baked_mesh.name
     _set_coordinates(baked_mesh.vertices, samples[0])
     baked_mesh.update()
 
     baked_object = bpy.data.objects.new("LibSM64 Mario Bake", baked_mesh)
-    baked_object_name = baked_object.name
     action = None
-    source_hide_render = source_object.hide_render
-    try:
-        source_hidden = source_object.hide_get()
-    except AttributeError:
-        source_hidden = getattr(source_object, "hide_viewport", False)
     try:
         collections = list(source_object.users_collection)
         target_collection = collections[0] if collections else context.scene.collection
         target_collection.objects.link(baked_object)
         baked_object.matrix_world = source_object.matrix_world.copy()
         _copy_object_display_settings(source_object, baked_object)
+
+        # Mesh.copy() must not leave a nested Key datablock shared with Live
+        # Mario. Clear only a proven-exclusive copied Key before creating the
+        # take's own shape-key stack.
+        copied_keys = getattr(baked_mesh, "shape_keys", None)
+        if copied_keys is not None:
+            if copied_keys is getattr(source_mesh, "shape_keys", None) or copied_keys.users != 1:
+                raise RecordingError("Could not create exclusive shape keys for the new take")
+            baked_object.shape_key_clear()
 
         baked_object.shape_key_add(name="Basis", from_mix=False)
         pose_keys = []
@@ -254,35 +311,12 @@ def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
         baked_object["libsm64_target_fps"] = float(target_fps)
         baked_object["libsm64_recording_start_frame"] = float(start_frame)
 
-        final_frame = sample_target_frame(start_frame, len(samples) - 1, target_fps)
-        if final_frame > context.scene.frame_end:
-            context.scene.frame_end = int(math.ceil(final_frame))
-
-        source_object.hide_render = True
-        try:
-            source_object.hide_set(True)
-        except AttributeError:
-            source_object.hide_viewport = True
-
-        for selected in list(context.selected_objects):
-            selected.select_set(False)
-        baked_object.hide_set(False)
-        baked_object.hide_render = False
-        baked_object.select_set(True)
-        context.view_layer.objects.active = baked_object
-        _set_scene_frame(context.scene, float(start_frame))
+        # Keep the candidate invisible until registration has validated it and
+        # committed the current-take visibility transition.
+        baked_object.hide_set(True)
+        baked_object.hide_render = True
+        validate_take_ownership(baked_object, source_object)
         return baked_object
     except Exception:
-        # A failed bake must not leave a misleading partial object in the scene.
-        source_object.hide_render = source_hide_render
-        try:
-            source_object.hide_set(source_hidden)
-        except AttributeError:
-            source_object.hide_viewport = source_hidden
-        if bpy.data.objects.get(baked_object_name) is baked_object:
-            bpy.data.objects.remove(baked_object, do_unlink=True)
-        if bpy.data.meshes.get(baked_mesh_name) is baked_mesh and baked_mesh.users == 0:
-            bpy.data.meshes.remove(baked_mesh)
-        if action is not None and action.users == 0:
-            bpy.data.actions.remove(action)
+        _remove_take_datablocks(baked_object, baked_mesh, action)
         raise
