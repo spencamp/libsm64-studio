@@ -7,6 +7,7 @@ import math
 import mathutils
 from typing import cast, List
 from . collision_types import COLLISION_TYPES
+from . recording import recorder
 
 if platform.system() == 'Windows':
     from . input_reader_win import sample_input_reader, start_input_reader, stop_input_reader
@@ -20,7 +21,10 @@ SM64_SCALE_FACTOR = 50
 
 origin_offset = [0.0, 0.0, 0.0]
 original_fps = 0
+original_fps_setting = 0
+original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
+simulation_scene = None
 
 class SM64Surface(ct.Structure):
     _fields_ = [
@@ -81,7 +85,8 @@ tick_count = 0
 last_cam_change_tick = -30
 
 def insert_mario(rom_path: str, scale: float, camera_follow: bool):
-    global sm64, sm64_mario_id, SM64_SCALE_FACTOR, original_fps, tick_count, origin_offset, original_cursor_pos, follow_cam
+    global sm64, sm64_mario_id, SM64_SCALE_FACTOR, original_fps, original_fps_setting
+    global original_fps_base, tick_count, origin_offset, original_cursor_pos, follow_cam, simulation_scene
 
     SM64_SCALE_FACTOR = scale
 
@@ -102,14 +107,15 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     origin_offset[1] = bpy.context.scene.cursor.location.y
     origin_offset[2] = bpy.context.scene.cursor.location.z
 
+    if sm64 is not None:
+        stop_tick_mario()
+    recorder.cancel("Ready for a new take")
+
     if 'LibSM64 Mario' in bpy.data.objects:
         bpy.data.objects['LibSM64 Mario'].select_set(True) # Blender 2.8x
         bpy.ops.object.delete()
 
     stop_input_reader()
-
-    if sm64 != None:
-        stop_tick_mario()
 
     this_path = os.path.dirname(os.path.realpath(__file__))
     dll_name = 'sm64.dll' if platform.system() == 'Windows' else 'libsm64.so'
@@ -145,34 +151,84 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
 
     start_input_reader()
 
-    original_fps = bpy.context.scene.render.fps
-    bpy.context.scene.render.fps = 30
+    simulation_scene = bpy.context.scene
+    original_fps_setting = simulation_scene.render.fps
+    original_fps_base = simulation_scene.render.fps_base
+    original_fps = float(original_fps_setting) / float(original_fps_base)
+    simulation_scene.render.fps = 30
+    simulation_scene.render.fps_base = 1.0
     bpy.ops.screen.animation_play()
+    remove_tick_mario_handlers()
     bpy.app.handlers.frame_change_pre.append(tick_mario)
 
     tick_count = 0
 
     return None
 
-def stop_tick_mario():
-    global sm64, sm64_mario_id, original_fps, original_cursor_pos
-    bpy.app.handlers.frame_change_pre.clear()
-    bpy.context.scene.render.fps = original_fps
-    bpy.context.scene.cursor.location = (
-        original_cursor_pos[0],
-        original_cursor_pos[1],
-        original_cursor_pos[2]
-    )
-    bpy.ops.screen.animation_cancel()
-    sm64_mario_id = -1
-    sm64.sm64_global_terminate()
-    sm64 = None
-    stop_input_reader()
+def remove_tick_mario_handlers():
+    """Remove this add-on's callbacks, including stale copies after reload."""
+    handlers = bpy.app.handlers.frame_change_pre
+    removed = 0
+    for handler in list(handlers):
+        if (handler is tick_mario or
+                (getattr(handler, '__module__', None) == __name__ and
+                 getattr(handler, '__name__', None) == 'tick_mario')):
+            handlers.remove(handler)
+            removed += 1
+    return removed
 
-def tick_mario(x0, x1):
+
+def is_mario_running():
+    return sm64 is not None and sm64_mario_id >= 0 and 'LibSM64 Mario' in bpy.data.objects
+
+
+def get_simulation_target_fps(scene=None):
+    if sm64 is not None and original_fps > 0:
+        return float(original_fps)
+    scene = scene or bpy.context.scene
+    return float(scene.render.fps) / float(scene.render.fps_base)
+
+
+def stop_tick_mario():
+    global sm64, sm64_mario_id, original_fps, original_fps_setting
+    global original_fps_base, original_cursor_pos, simulation_scene
+
+    removed_handlers = remove_tick_mario_handlers()
+    scene = simulation_scene
+    was_running = sm64 is not None or scene is not None or removed_handlers > 0
+    if scene is not None:
+        if original_fps_setting > 0:
+            scene.render.fps = original_fps_setting
+            scene.render.fps_base = original_fps_base
+        scene.cursor.location = (
+            original_cursor_pos[0],
+            original_cursor_pos[1],
+            original_cursor_pos[2]
+        )
+    if was_running:
+        try:
+            bpy.ops.screen.animation_cancel()
+        except (RuntimeError, AttributeError):
+            pass
+    active_library = sm64
+    sm64_mario_id = -1
+    sm64 = None
+    original_fps = 0
+    original_fps_setting = 0
+    original_fps_base = 1.0
+    simulation_scene = None
+    try:
+        if active_library is not None:
+            active_library.sm64_global_terminate()
+    finally:
+        stop_input_reader()
+
+def tick_mario(scene, depsgraph=None):
     global sm64, sm64_mario_id, mario_state, mario_geo, tick_count, last_cam_change_tick, origin_offset, follow_cam
 
     if not ('LibSM64 Mario' in bpy.data.objects):
+        if recorder.active:
+            recorder.fail("Live Mario was deleted; recording cancelled", preserve_samples=False)
         stop_tick_mario()
         return 0
 
@@ -224,6 +280,10 @@ def tick_mario(x0, x1):
     else:
         update_mesh_data_fast(bpy.data.meshes['libsm64_mario_mesh'])
 
+    try:
+        recorder.capture_mesh(bpy.data.meshes['libsm64_mario_mesh'], tick_count)
+    except Exception as exc:
+        recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
     tick_count += 1
 
 def clamp_bounds(val):
@@ -316,7 +376,7 @@ def get_all_surfaces():
     out = []
 
     for obj in cast(List[bpy.types.Object], scene.collection.all_objects):
-        if isinstance(obj.data, bpy.types.Mesh):
+        if isinstance(obj.data, bpy.types.Mesh) and not obj.get('libsm64_is_bake', False):
             add_mesh(obj, out)
 
     return out

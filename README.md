@@ -21,9 +21,58 @@ Before opening Blender make sure you have an XInput controller connected if you 
 
 *Note:* The SM64 US ROM must be the one with the SHA1 checksum of `9bef1128717f958171a4afac3ed78ee2bb4e86ce`.
 
+### Recording short animations
+
+The **Animation Recording** section in the LibSM64 sidebar can turn a short live
+performance into a self-contained Blender mesh animation:
+
+1. Set the scene FPS, insert Mario, and control him normally.
+2. Move the timeline to the desired output start frame and click **Start Recording**.
+3. Perform the take, then click **Stop & Bake**.
+4. Scrub or render the selected `LibSM64 Mario Bake` object. The live object is
+   stopped and hidden after a successful bake.
+
+The bake has one shape key per 30 Hz libsm64 sample and uses constant
+interpolation. Samples are placed at fractional frames when necessary, preserving
+the take's real-time duration at 24, 30, 60, or other target frame rates. Each
+take owns its mesh, shape-key datablock, and action, so later takes do not modify
+earlier ones. The baked object can be saved and reopened without libsm64, the ROM,
+a controller, or a frame-change handler.
+
+This MVP is intended for short cinematic takes. A four-second take creates about
+120 shape keys, and the panel warns at 300 samples (about ten seconds); there is
+no hard sample limit. It records vertex positions only. The copied mesh preserves
+the current material, texture image, UV layer, and vertex colors, but later
+blinking/facial UV changes, changing vertex colors, simulation, and collision are
+not part of baked playback. Blender calculates displayed normals from the
+deformed geometry.
+
+Use **Cancel Recording** to discard a pending take without stopping Mario.
+
+### Manual recording smoke test
+
+Run the following for each target FPS you need to validate (especially 24, 30,
+and 60):
+
+1. Open Blender with the add-on enabled and set the scene FPS.
+2. Add collision ground, place the 3D cursor over it, and insert Mario.
+3. Start recording and control Mario for approximately four seconds.
+4. Click **Stop & Bake** and confirm the baked object is selected, the live object
+   is hidden, and the scene FPS has returned to its original value.
+5. Scrub from the recording start frame through the take. Confirm poses are held,
+   do not blend, and the duration is about four seconds.
+6. Render frames in Eevee and Cycles.
+7. Save the `.blend`, close Blender, disconnect the controller or make the ROM
+   unavailable, reopen the file, and verify the bake still scrubs and renders.
+8. Insert Mario again, record a second take, and verify the first bake and its
+   action remain unchanged.
+9. Install a temporary unrelated `frame_change_pre` handler, run and stop another
+   simulation, and verify that handler remains installed.
+
 ### Current Features
 - Insert playable Mario into Blender scene
 - Fast64 terrain type and collision surface type support
+- Bake short Mario performances to self-contained shape-key animation
 
 ### Near-term Features
 - Water boxes support
