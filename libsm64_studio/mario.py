@@ -13,9 +13,13 @@ from . collision_types import COLLISION_TYPES
 from . recording import recorder
 
 if platform.system() == 'Windows':
-    from . input_reader_win import sample_input_reader, start_input_reader, stop_input_reader
+    from . input_reader_win import (
+        clear_input_reader_state, sample_input_reader, start_input_reader, stop_input_reader,
+    )
 else:
-    from . input_reader import sample_input_reader, start_input_reader, stop_input_reader
+    from . input_reader import (
+        clear_input_reader_state, sample_input_reader, start_input_reader, stop_input_reader,
+    )
 
 SM64_TEXTURE_WIDTH = 64 * 11
 SM64_TEXTURE_HEIGHT = 64
@@ -25,6 +29,15 @@ LIVE_ROLE = "libsm64_live_role"
 LIVE_ROLE_VALUE = "LIVE_MARIO"
 EXPECTED_ROM_SHA1 = "9bef1128717f958171a4afac3ed78ee2bb4e86ce"
 LIFECYCLE_REGISTRY_KEY = "libsm64_studio_native_lifecycle"
+SIMULATION_FPS = 30.0
+SIMULATION_INTERVAL = 1.0 / SIMULATION_FPS
+
+STOPPED = "STOPPED"
+LIVE_IDLE = "LIVE_IDLE"
+RECORDING = "RECORDING"
+BAKING = "BAKING"
+RESETTING = "RESETTING"
+POISONED = "POISONED"
 
 origin_offset = [0.0, 0.0, 0.0]
 original_fps = 0
@@ -100,6 +113,13 @@ class NativeLifecycle:
         self.mario_id = -1
         self.tick_handler = None
         self.tick_handler_installed = False
+        self.timer_callback = None
+        self.timer_installed = False
+        self.control_state = STOPPED
+        self.last_error = ""
+        self.neutral_input_ticks = 0
+        self.recording_tick_origin = None
+        self.native_ownership_uncertain = False
         self.shutdown_in_progress = False
         self.shutdown_complete = False
         self.session_committed = False
@@ -156,6 +176,10 @@ def lifecycle_snapshot():
         "mario_created": session.mario_created,
         "mario_id": session.mario_id,
         "tick_handler_installed": session.tick_handler_installed,
+        "timer_installed": session.timer_installed,
+        "control_state": session.control_state,
+        "last_error": session.last_error,
+        "native_ownership_uncertain": session.native_ownership_uncertain,
         "shutdown_in_progress": session.shutdown_in_progress,
         "shutdown_complete": session.shutdown_complete,
         "session_committed": session.session_committed,
@@ -250,27 +274,78 @@ def _configure_native_api(library):
     library.sm64_mario_tick.restype = None
 
 
-def _make_tick_handler(session):
-    def session_tick(scene, depsgraph=None):
+def _make_tick_timer(session):
+    def session_tick():
         if not _session_is_registered_owner(session):
-            return 0
+            session.timer_installed = False
+            return None
         if session.shutdown_in_progress or session.shutdown_complete:
-            return 0
-        return tick_mario(scene, depsgraph, _session=session)
+            session.timer_installed = False
+            return None
+        if session.control_state in (STOPPED, POISONED):
+            session.timer_installed = False
+            return None
+        if session.control_state in (BAKING, RESETTING):
+            return SIMULATION_INTERVAL
+        try:
+            tick_mario(session.scene or bpy.context.scene, _session=session)
+        except Exception as exc:
+            message = "Live Mario simulation failed: {}".format(exc)
+            if recorder.active:
+                recorder.fail(message, preserve_samples=True)
+            _poison_session(session, message)
+            return None
+        if not _session_is_registered_owner(session):
+            session.timer_installed = False
+            return None
+        if session.shutdown_in_progress or session.shutdown_complete:
+            session.timer_installed = False
+            return None
+        return SIMULATION_INTERVAL
 
-    session_tick.__name__ = "libsm64_session_tick"
+    session_tick.__name__ = "libsm64_session_timer"
     session_tick._libsm64_owner_token = session.owner_token
     session_tick._libsm64_generation = session.generation
     return session_tick
 
 
-def _install_tick_handler(session):
-    remove_tick_mario_handlers(session)
-    if session.tick_handler is None:
-        session.tick_handler = _make_tick_handler(session)
-    bpy.app.handlers.frame_change_pre.append(session.tick_handler)
-    session.tick_handler_installed = True
-    _lifecycle_log(session, "tick installed")
+def _install_tick_timer(session):
+    if session.timer_callback is None:
+        session.timer_callback = _make_tick_timer(session)
+    if bpy.app.timers.is_registered(session.timer_callback):
+        session.timer_installed = True
+        return False
+    bpy.app.timers.register(session.timer_callback, first_interval=SIMULATION_INTERVAL)
+    session.timer_installed = True
+    _lifecycle_log(session, "timer installed")
+    return True
+
+
+def remove_tick_mario_timer(session=None):
+    """Unregister exactly one timer owned by one lifecycle generation."""
+    session = session or _lifecycle
+    callback = session.timer_callback
+    removed = False
+    if callback is not None and bpy.app.timers.is_registered(callback):
+        try:
+            bpy.app.timers.unregister(callback)
+            removed = True
+        except (ValueError, RuntimeError):
+            # A callback currently on Blender's timer stack also stops itself
+            # by returning None after observing shutdown/poisoned state.
+            pass
+    if removed or session.timer_installed:
+        _lifecycle_log(session, "timer removed")
+    session.timer_installed = False
+    return removed
+
+
+def _poison_session(session, message):
+    session.control_state = POISONED
+    session.last_error = str(message)
+    remove_tick_mario_timer(session)
+    _clear_transient_input_state(session)
+    _lifecycle_log(session, "session poisoned: {}".format(message))
 
 
 def _create_live_object():
@@ -286,17 +361,6 @@ def _prepare_blender_for_insert():
     except Exception:
         pass
     bpy.ops.object.select_all(action='DESELECT')
-
-
-def _start_blender_playback():
-    bpy.ops.screen.animation_play()
-
-
-def _cancel_blender_playback():
-    try:
-        bpy.ops.screen.animation_cancel()
-    except (RuntimeError, AttributeError):
-        pass
 
 
 def insert_mario(rom_path: str, scale: float, camera_follow: bool):
@@ -384,13 +448,10 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         original_fps_setting = simulation_scene.render.fps
         original_fps_base = simulation_scene.render.fps_base
         original_fps = float(original_fps_setting) / float(original_fps_base)
-        simulation_scene.render.fps = 30
-        simulation_scene.render.fps_base = 1.0
-        _start_blender_playback()
-        _install_tick_handler(session)
-
         tick_count = 0
         session.session_committed = True
+        session.control_state = LIVE_IDLE
+        _install_tick_timer(session)
         return None
     except Exception as exc:
         if session.global_init_attempted and not session.global_initialized:
@@ -462,15 +523,63 @@ def is_mario_running():
         and session.mario_id >= 0
         and not session.shutdown_in_progress
         and not session.shutdown_complete
+        and session.control_state != POISONED
         and get_live_mario_object() is not None
     )
 
 
+def has_owned_native_session():
+    session = _lifecycle
+    return bool(
+        _session_is_registered_owner(session)
+        and not session.shutdown_complete
+    )
+
+
+def live_control_status():
+    """Return the explicit native-control state used by the panel and tests."""
+    session = _lifecycle
+    if session.control_state == POISONED:
+        return POISONED
+    if not is_mario_running():
+        return STOPPED
+    return session.control_state
+
+
+def live_control_error():
+    return _lifecycle.last_error
+
+
 def get_simulation_target_fps(scene=None):
-    if is_mario_running() and original_fps > 0:
-        return float(original_fps)
     scene = scene or bpy.context.scene
     return float(scene.render.fps) / float(scene.render.fps_base)
+
+
+def _clear_transient_input_state(session=None):
+    session = session or _lifecycle
+    for field in (
+        "camLookX", "camLookZ", "stickX", "stickY",
+        "buttonA", "buttonB", "buttonZ",
+    ):
+        setattr(mario_inputs, field, 0)
+    try:
+        from . import input_value
+        for key in input_value:
+            input_value[key] = False
+    except (ImportError, AttributeError, TypeError):
+        pass
+    clear_input_reader_state()
+    session.neutral_input_ticks = max(session.neutral_input_ticks, 1)
+
+
+def _disable_keyboard_control():
+    try:
+        from . import config, input_value
+        config["keyboard_control"] = False
+        for key in input_value:
+            input_value[key] = False
+    except (ImportError, AttributeError, TypeError):
+        pass
 
 
 def capture_mario_starting_mark():
@@ -508,22 +617,38 @@ def restore_mario_starting_mark(mark):
     position = mark["position"]
     spawn = tuple(max(-32768, min(32767, int(round(value)))) for value in position)
     old_id = session.mario_id
-    session.library.sm64_mario_delete(old_id)
+    try:
+        session.library.sm64_mario_delete(old_id)
+    except Exception as exc:
+        session.mario_delete_attempted = True
+        _poison_session(
+            session,
+            "Mario reset cleanup failed; use End Mario Control and restart Blender: {}".format(exc),
+        )
+        raise MarioLifecycleError(session.last_error)
     session.mario_created = False
     session.mario_id = -1
     sm64_mario_id = -1
-    replacement_id = int(session.library.sm64_mario_create(*spawn))
+    try:
+        replacement_id = int(session.library.sm64_mario_create(*spawn))
+    except Exception as exc:
+        session.native_ownership_uncertain = True
+        _poison_session(
+            session,
+            "Mario reset creation failed with uncertain native ownership; restart Blender: {}".format(exc),
+        )
+        raise MarioLifecycleError(session.last_error)
     if replacement_id < 0:
-        raise RuntimeError("Could not restore Live Mario at the starting mark")
+        _poison_session(
+            session,
+            "Could not restore Live Mario at the starting mark; use End Mario Control",
+        )
+        raise MarioLifecycleError(session.last_error)
     session.mario_id = replacement_id
     session.mario_created = True
     sm64_mario_id = replacement_id
 
-    for field in (
-        "camLookX", "camLookZ", "stickX", "stickY",
-        "buttonA", "buttonB", "buttonZ",
-    ):
-        setattr(mario_inputs, field, 0)
+    _clear_transient_input_state(session)
     session.library.sm64_mario_tick(
         session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
     )
@@ -541,26 +666,75 @@ def restore_mario_starting_mark(mark):
 
 
 def resume_mario_for_recording():
-    """Run libsm64 at its fixed 30 Hz while preserving the output FPS target."""
+    """Compatibility wrapper: ensure the persistent live timer is installed."""
     if not is_mario_running():
         raise RuntimeError("Live Mario is unavailable")
-    scene = simulation_scene or bpy.context.scene
-    scene.render.fps = 30
-    scene.render.fps_base = 1.0
-    _install_tick_handler(_lifecycle)
-    screen = getattr(bpy.context, "screen", None)
-    if screen is None or not getattr(screen, "is_animation_playing", False):
-        _start_blender_playback()
+    _install_tick_timer(_lifecycle)
 
 
 def pause_mario_for_review():
-    """Pause simulation and restore Blender's FPS for timeline review."""
-    remove_tick_mario_handlers()
-    scene = simulation_scene
-    if scene is not None and original_fps_setting > 0:
-        scene.render.fps = original_fps_setting
-        scene.render.fps_base = original_fps_base
-    _cancel_blender_playback()
+    """Compatibility no-op: timeline review no longer pauses Live Mario."""
+    if is_mario_running():
+        _install_tick_timer(_lifecycle)
+
+
+def begin_mario_recording(scene):
+    """Atomically capture the current mark and layer capture over live simulation."""
+    session = _lifecycle
+    if not is_mario_running() or session.control_state != LIVE_IDLE:
+        raise RuntimeError("Live Mario is not ready to record")
+    if recorder.has_pending_samples:
+        raise RuntimeError("Cancel or finish the pending take before recording again")
+    mark = capture_mario_starting_mark()
+    try:
+        recorder.start(float(scene.frame_current), get_simulation_target_fps(scene))
+        session.recording_tick_origin = tick_count
+        session.control_state = RECORDING
+        _install_tick_timer(session)
+    except Exception:
+        session.recording_tick_origin = None
+        if is_mario_running():
+            session.control_state = LIVE_IDLE
+        raise
+    return mark
+
+
+def freeze_mario_recording_for_bake():
+    session = _lifecycle
+    if session.control_state != RECORDING and not recorder.has_pending_samples:
+        raise RecordingError("Live Mario is not recording")
+    try:
+        samples = recorder.freeze_for_bake()
+    except Exception:
+        session.control_state = LIVE_IDLE if is_mario_running() else STOPPED
+        raise
+    session.control_state = BAKING
+    return samples
+
+
+def resume_live_idle_after_transition(mark):
+    """Restore one take mark and immediately resume controllable idle operation."""
+    session = _lifecycle
+    if not is_mario_running():
+        raise RuntimeError("Live Mario is unavailable")
+    session.control_state = RESETTING
+    try:
+        restore_mario_starting_mark(mark)
+    except Exception:
+        if session.control_state != POISONED:
+            _poison_session(session, "Live Mario reset failed")
+        raise
+    session.recording_tick_origin = None
+    session.control_state = LIVE_IDLE
+    _install_tick_timer(session)
+
+
+def abandon_bake_transition():
+    """Return a safe session to idle while retaining recorder error samples."""
+    session = _lifecycle
+    if is_mario_running() and session.control_state != POISONED:
+        session.control_state = LIVE_IDLE
+        _install_tick_timer(session)
 
 
 def stop_tick_mario(_session=None, _cleanup_rejected=True):
@@ -583,18 +757,14 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
     errors = []
     scene = session.scene or simulation_scene
     was_running = session.session_committed
+    remove_tick_mario_timer(session)
     remove_tick_mario_handlers(session)
     if scene is not None:
-        if original_fps_setting > 0:
-            scene.render.fps = original_fps_setting
-            scene.render.fps_base = original_fps_base
         scene.cursor.location = (
             original_cursor_pos[0],
             original_cursor_pos[1],
             original_cursor_pos[2]
         )
-    if was_running:
-        _cancel_blender_playback()
     try:
         if session.mario_created and not session.mario_delete_attempted:
             if not (session.library_loaded and session.global_initialized and session.library):
@@ -615,7 +785,10 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             _lifecycle_log(session, "Mario delete skipped: no Mario instance was created")
 
         if session.global_initialized and not session.global_terminate_attempted:
-            if session.mario_created:
+            if session.native_ownership_uncertain:
+                errors.append("Global termination skipped because native Mario ownership is uncertain")
+                _lifecycle_log(session, "global terminate skipped: native ownership is uncertain")
+            elif session.mario_created:
                 errors.append("Global termination skipped because Mario deletion did not complete")
                 _lifecycle_log(session, "global terminate skipped: Mario instance may still be active")
             elif not (session.library_loaded and session.library):
@@ -643,6 +816,7 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             except Exception as exc:
                 errors.append("Input cleanup failed: {}".format(exc))
             session.input_started = False
+        _disable_keyboard_control()
         live_object = bpy.data.objects.get(session.live_object_name) if session.live_object_name else None
         if (
             live_object is not None
@@ -664,8 +838,12 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
         original_fps_base = 1.0
         simulation_scene = None
         if errors:
+            session.control_state = POISONED
+            session.last_error = "; ".join(errors)
             _lifecycle_log(session, "shutdown completed with errors; lifecycle is poisoned")
         else:
+            session.control_state = STOPPED
+            session.last_error = ""
             _release_session(session)
             _lifecycle_log(session, "shutdown completed")
     if was_running and _cleanup_rejected:
@@ -689,14 +867,21 @@ def tick_mario(scene, depsgraph=None, _session=None):
         stop_tick_mario(_session=session)
         return 0
 
-    sample_input_reader(mario_inputs)
+    if session.neutral_input_ticks > 0:
+        _clear_transient_input_state(session)
+        session.neutral_input_ticks -= 1
+    else:
+        sample_input_reader(mario_inputs)
 
-    for a in bpy.context.window.screen.areas:
-        if a.type == 'VIEW_3D':
-            view3d = a
+    view3d = None
+    for window in getattr(bpy.context.window_manager, "windows", ()):
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                view3d = area
+                break
+        if view3d is not None:
             break
-
-    r3d = view3d.spaces[0].region_3d
+    r3d = view3d.spaces[0].region_3d if view3d is not None else None
 
     # Get rotation inputs (assuming values from 0-1)
     camLookX = mario_inputs.camLookX  # horizontal rotation (around Z)
@@ -704,7 +889,7 @@ def tick_mario(scene, depsgraph=None, _session=None):
     ticks_since_cam_change = tick_count - last_cam_change_tick
     is_cam_change_ok = ticks_since_cam_change > 8
 
-    if is_cam_change_ok:
+    if r3d is not None and is_cam_change_ok:
         if camLookX != 0:  # Dead zone handled in inputs
             rot_angle = math.radians(360.0 * camLookX)
             rotation = mathutils.Quaternion((0, 0, 1), rot_angle)
@@ -715,24 +900,26 @@ def tick_mario(scene, depsgraph=None, _session=None):
             r3d.view_distance *= zoom_factor
             last_cam_change_tick = tick_count
 
-    look_dir = r3d.view_rotation @ mathutils.Vector((0.0, 0.0, -1.0))
-    mario_inputs.camLookX = look_dir.x
-    mario_inputs.camLookZ = -look_dir.y
+    if r3d is not None:
+        look_dir = r3d.view_rotation @ mathutils.Vector((0.0, 0.0, -1.0))
+        mario_inputs.camLookX = look_dir.x
+        mario_inputs.camLookZ = -look_dir.y
 
     session.library.sm64_mario_tick(
         session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
     )
 
     if follow_cam:
-        bpy.context.scene.cursor.location = (
-            origin_offset[0] + mario_state.posX / SM64_SCALE_FACTOR + bpy.context.scene.libsm64.camera_shift.x,
-            origin_offset[1] - mario_state.posZ / SM64_SCALE_FACTOR + bpy.context.scene.libsm64.camera_shift.y,
-            origin_offset[2] + mario_state.posY / SM64_SCALE_FACTOR + bpy.context.scene.libsm64.camera_shift.z
+        scene.cursor.location = (
+            origin_offset[0] + mario_state.posX / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.x,
+            origin_offset[1] - mario_state.posZ / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.y,
+            origin_offset[2] + mario_state.posY / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.z
         )
 
-        for region in (r for r in view3d.regions if r.type == 'WINDOW'):
-            with bpy.context.temp_override(area=view3d, region=region):
-                bpy.ops.view3d.view_center_cursor()
+        if view3d is not None:
+            for region in (r for r in view3d.regions if r.type == 'WINDOW'):
+                with bpy.context.temp_override(area=view3d, region=region):
+                    bpy.ops.view3d.view_center_cursor()
 
     live_mesh = _ensure_live_mesh_exclusive(live_object)
     if tick_count < 15: # This is enough frames to get Mario to open his eyes, then we'll stop updating uv/color
@@ -744,7 +931,11 @@ def tick_mario(scene, depsgraph=None, _session=None):
         recorder.capture_mesh(live_mesh, tick_count)
     except Exception as exc:
         recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
+        if session.control_state == RECORDING:
+            session.control_state = LIVE_IDLE
     tick_count += 1
+    if view3d is not None:
+        view3d.tag_redraw()
 
 def clamp_bounds(val):
     val = int(val)

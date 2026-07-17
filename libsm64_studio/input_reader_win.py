@@ -5,6 +5,12 @@ from queue import Queue
 
 g_proc = None
 
+
+def clear_input_reader_state():
+    # The helper reports current controller state on demand rather than storing
+    # an event queue. Mario's neutral-input grace tick handles reset safety.
+    pass
+
 def stop_input_reader():
     global g_proc
     if g_proc != None:

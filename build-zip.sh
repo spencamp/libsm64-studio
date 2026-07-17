@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-rm -rf libsm64-blender
-mkdir libsm64-blender
-cp -r lib libsm64-blender/lib
-cp *.py libsm64-blender
-zip -r "libsm64-blender-$1.zip" libsm64-blender
+output="${1:-libsm64_studio.zip}"
+python tools/build_addon_zip.py "$output"

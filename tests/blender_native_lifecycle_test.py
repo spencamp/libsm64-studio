@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.2.2+native-lifecycle"
+    assert addon.BUILD_ID == "2.3.0+live-control"
 
 
 class NativeCall:
@@ -81,8 +81,9 @@ def install_harness(module):
         "stop", input_counts["stop"] + 1
     )
     module._prepare_blender_for_insert = lambda: None
-    module._start_blender_playback = lambda: None
-    module._cancel_blender_playback = lambda: None
+    module.update_mesh_data = lambda _mesh: None
+    module.update_mesh_data_fast = lambda _mesh: None
+    module.sample_input_reader = lambda _inputs: None
 
 
 def insert_with(library, live_factory=None):
@@ -99,10 +100,14 @@ def insert_with(library, live_factory=None):
 
 def assert_idle():
     state = mario.lifecycle_snapshot()
+    callback = mario._lifecycle.timer_callback
     assert not state["library_loaded"]
     assert not state["global_initialized"]
     assert not state["mario_created"]
     assert not state["tick_handler_installed"]
+    assert not state["timer_installed"]
+    assert callback is None or not bpy.app.timers.is_registered(callback)
+    assert state["control_state"] == mario.STOPPED
     assert not mario.is_mario_running()
     assert mario._lifecycle_registry().get("active") is None
 
@@ -163,15 +168,14 @@ assert first.counts() == {
 assert second.counts() == {
     "global_init": 1, "global_terminate": 0, "mario_create": 1, "mario_delete": 0,
 }
-assert len([
+assert mario.lifecycle_snapshot()["control_state"] == mario.LIVE_IDLE
+assert bpy.app.timers.is_registered(mario._lifecycle.timer_callback)
+assert not [
     handler for handler in bpy.app.handlers.frame_change_pre
     if getattr(handler, "_libsm64_owner_token", None) == mario._lifecycle.owner_token
-]) == 1
+]
 mario.resume_mario_for_recording()
-assert len([
-    handler for handler in bpy.app.handlers.frame_change_pre
-    if getattr(handler, "_libsm64_generation", None) == mario._lifecycle.generation
-]) == 1
+assert bpy.app.timers.is_registered(mario._lifecycle.timer_callback)
 mario.stop_tick_mario()
 mario.stop_tick_mario()
 assert second.counts() == {
@@ -233,7 +237,7 @@ assert_idle()
 manual_delete = FakeLibrary()
 assert insert_with(manual_delete) is None
 bpy.data.objects.remove(mario.get_live_mario_object(), do_unlink=True)
-mario._lifecycle.tick_handler(bpy.context.scene)
+mario._lifecycle.timer_callback()
 assert manual_delete.counts() == {
     "global_init": 1, "global_terminate": 1, "mario_create": 1, "mario_delete": 1,
 }

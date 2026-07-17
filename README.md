@@ -26,13 +26,23 @@ Before opening Blender make sure you have an XInput controller connected if you 
 The **Performance Recording** section is built around one controllable Live Mario
 and any number of baked takes:
 
-1. Set the scene FPS, insert Mario, and control him normally.
-2. Move the timeline to the desired output start frame and click **Start Recording**.
+1. Set the scene FPS and insert Mario. Live Mario immediately enters rehearsal
+   mode and remains controllable between takes.
+2. Move around for as long as needed, stop at the exact desired starting mark,
+   move the timeline to the desired output start frame, and click **Start Recording**.
 3. Perform the take, then click **Stop & Bake**.
 4. Live Mario returns to the mark captured at recording start, with transient
-   movement state cleared. Blender's output FPS is restored for review.
+   movement state cleared. Live control resumes immediately at that mark.
 5. Scrub or play the result with Blender's normal timeline controls, favorite or
-   reject it, or click **Start Recording** immediately for one more take.
+   reject it, keep rehearsing, or click **Start Recording** for another take
+   without reinserting Mario or pressing a resume control.
+
+Live simulation runs from one add-on-owned Blender timer at approximately 30 Hz.
+It is independent of timeline playback and never changes the scene's render FPS
+or FPS base. Timeline playback and scrubbing therefore remain available at the
+chosen output rate while Live Mario continues to respond. Idle/rehearsal ticks
+update only Live Mario; geometry enters the recorder only between **Start
+Recording** and **Stop & Bake**.
 
 Takes appear as `Take 001`, `Take 002`, and so on. Numbers increase monotonically
 and are not reused after deletion. The current regular take is visible; selecting
@@ -67,33 +77,76 @@ not part of baked playback. Blender calculates displayed normals from the
 deformed geometry.
 
 Use **Cancel Recording** to discard a pending take and return Live Mario to the
-captured starting mark without creating a take.
+captured starting mark without creating a take. Control resumes immediately.
+Live Mario remains visible during control; baked-take visibility continues to
+follow the current/favorite/regular/rejected rules independently. If the two
+overlap after a reset, move Live Mario to continue rehearsing or hide it manually.
 
 ### Manual recording smoke test
+
+### Automated Blender CLI tests
+
+From the repository root, build and test the installable add-on with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_blender_tests.ps1
+```
+
+The runner defaults to the Steam Blender 5.2 installation at
+`C:\Program Files (x86)\Steam\steamapps\common\Blender\5.2\blender.exe`. Override
+it when needed with `-BlenderPath "C:\path\to\blender.exe"`. For Steam layouts
+that keep `blender.exe` beside the `5.2` data directory, the runner detects the
+sibling executable automatically. Run only the
+packaged enable/import/register/unregister check with `-SmokeOnly`. Add
+`-KeepTemp` to retain the run directory for diagnosis.
+
+Each invocation creates uniquely named package staging, ZIP, Blender user
+configuration, user scripts/add-ons, user data, extension, and `.blend` paths
+under the system temporary directory. It copies the complete installable package
+and native DLLs before Blender starts, verifies the ZIP contents, and runs with
+`--background --factory-startup`. It never installs into the normal Blender
+profile, opens an existing `.blend`, or attaches to another Blender process.
+
+The automated suite covers packaged add-on import and lifecycle registration,
+timer-driven live control, native lifecycle ownership, and the three-take
+regression. The controller feel, viewport redraw/appearance, material preview,
+Eevee/Cycles rendering, and interactive playback/scrubbing checks below still
+require a normal GUI Blender session.
 
 Run the following for each target FPS you need to validate (especially 24, 30,
 and 60):
 
-1. Open Blender with the add-on enabled and set the scene FPS.
+1. Open Blender with the add-on enabled and set the scene FPS to 24.
 2. Add collision ground, place the 3D cursor over it, and insert Mario.
-3. Start recording and control Mario for approximately four seconds.
-4. Click **Stop & Bake** and confirm `Take 001` is selected and visible, Live
-   Mario returns to its starting mark, and the scene FPS returns to its original
-   value.
-5. Scrub from the recording start frame through the take. Confirm poses are held,
+3. Confirm Mario moves before recording. Rehearse for at least ten seconds and
+   verify no samples or take are created.
+4. Stop at a chosen mark, start recording, and perform for approximately four seconds.
+5. Click **Stop & Bake** and confirm `Take 001` is selected and visible, Live
+   Mario returns to its starting mark, remains immediately controllable, and the
+   scene stays at 24 FPS with its original FPS base.
+6. Scrub from the recording start frame through the take. Confirm poses are held,
    do not blend, and the duration is about four seconds.
-6. Render frames in Eevee and Cycles.
-7. Save the `.blend`, close Blender, disconnect the controller or make the ROM
+7. Move Live Mario elsewhere without clicking another control, then record and
+   bake `Take 002` without reinserting Mario.
+8. Start a third take, cancel it, and confirm Live Mario returns to that take's
+   starting mark and is immediately controllable.
+9. Play and scrub baked takes at 24 FPS while confirming Live Mario's timer does
+   not force timeline playback or move the current frame on its own.
+10. Render frames in Eevee and Cycles.
+11. Save the `.blend`, close Blender, disconnect the controller or make the ROM
    unavailable, reopen the file, and verify the bake still scrubs and renders.
-8. Without reinserting Mario, record `Take 002` and verify `Take 001` is hidden
-   while its mesh and action remain unchanged.
-9. Install a temporary unrelated `frame_change_pre` handler, run and stop another
+12. Verify `Take 001` is hidden while its mesh and action remain unchanged after
+   the later regular take becomes current.
+13. Install a temporary unrelated `frame_change_pre` handler, run and stop another
    simulation, and verify that handler remains installed.
-10. Favorite a take and record another; confirm both remain visible. Reject two
+14. Favorite a take and record another; confirm both remain visible. Reject two
     regular takes, end Mario control, and confirm only rejected take-owned data is
     deleted.
-11. Save and reopen a file containing regular, favorite, and rejected takes;
+15. Save and reopen a file containing regular, favorite, and rejected takes;
     verify categories, current visibility, and the next take number are restored.
+16. Repeat the rehearsal, record, bake, cancel, review, and shutdown checks at
+    30 and 60 FPS. Confirm native Mario delete/global terminate occur once at
+    **End Mario Control** and no owned timer remains.
 
 ### Texture persistence acceptance test
 

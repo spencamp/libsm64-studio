@@ -1,9 +1,52 @@
+import importlib
+import sys
+
+
+_MARIO_REQUIRED_API = (
+    "BAKING", "LIVE_IDLE", "POISONED", "RECORDING", "RESETTING", "STOPPED",
+    "abandon_bake_transition", "begin_mario_recording",
+    "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
+)
+
+
+def _reload_stale_runtime_modules():
+    """Refresh an older cached submodule before importing the packaged API.
+
+    Blender can execute a newly installed package ``__init__.py`` while keeping
+    submodules from the previous add-on version in ``sys.modules``.  Reload only
+    when the cached Mario module demonstrably lacks this package's required API.
+    """
+    mario_name = "{}.mario".format(__package__)
+    cached_mario = sys.modules.get(mario_name)
+    if cached_mario is None or all(
+        hasattr(cached_mario, symbol) for symbol in _MARIO_REQUIRED_API
+    ):
+        return
+
+    shutdown = getattr(cached_mario, "stop_tick_mario", None)
+    if callable(shutdown):
+        errors = shutdown()
+        if errors:
+            raise RuntimeError(
+                "The previous libsm64 runtime could not shut down cleanly; "
+                "restart Blender before enabling the updated add-on"
+            )
+
+    for suffix in ("recording", "input_reader", "input_reader_win", "mario"):
+        module = sys.modules.get("{}.{}".format(__package__, suffix))
+        if module is not None:
+            importlib.reload(module)
+
+
+_reload_stale_runtime_modules()
+
+
 bl_info = {
     "name" : "libsm64-blender",
     "author" : "libsm64",
     "description" : "Add a playble Mario to your Blender Scene",
     "blender" : (2, 80, 0),
-    "version" : (2, 2, 2),
+    "version" : (2, 3, 0),
     "location" : "View3D",
     "warning" : "",
     "category" : "Generic"
@@ -15,14 +58,22 @@ import math
 import platform
 from bpy.app.handlers import persistent
 from . mario import (
-    capture_mario_starting_mark,
-    get_simulation_target_fps,
+    BAKING,
+    LIVE_IDLE,
+    POISONED,
+    RECORDING,
+    RESETTING,
+    STOPPED,
+    abandon_bake_transition,
+    begin_mario_recording,
+    freeze_mario_recording_for_bake,
     get_live_mario_object,
+    has_owned_native_session,
     insert_mario,
     is_mario_running,
-    pause_mario_for_review,
-    restore_mario_starting_mark,
-    resume_mario_for_recording,
+    live_control_error,
+    live_control_status,
+    resume_live_idle_after_transition,
     stop_tick_mario,
 )
 from . recording import (
@@ -57,7 +108,7 @@ from .take_manager import (
 
 _recording_start_mark = None
 _confirmation_message = ""
-BUILD_ID = "2.2.2+native-lifecycle"
+BUILD_ID = "2.3.0+live-control"
 
 
 def _addon_preferences(context):
@@ -201,10 +252,17 @@ class Main_PT_Panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Performance Recording")
         box.label(text="Build {}".format(BUILD_ID))
-        if recorder.active:
+        control_status = live_control_status()
+        if control_status == RECORDING:
             box.label(text="Live Mario: Recording", icon='REC')
-        elif is_mario_running():
-            box.label(text="Live Mario: Ready", icon='CHECKMARK')
+        elif control_status == LIVE_IDLE:
+            box.label(text="Live Mario: Rehearsing", icon='CHECKMARK')
+        elif control_status in (BAKING, RESETTING):
+            box.label(text="Live Mario: Working", icon='TIME')
+        elif control_status == POISONED:
+            box.label(text="Live Mario: Error â€” end control or restart", icon='ERROR')
+            if live_control_error():
+                box.label(text=live_control_error(), icon='INFO')
         else:
             box.label(text="Live Mario: Unavailable", icon='ERROR')
 
@@ -214,13 +272,13 @@ class Main_PT_Panel(bpy.types.Panel):
             primary.enabled = recorder.has_pending_samples or recorder.active
             primary.operator(StopAndBake_OT_Operator.bl_idname, text="Stop & Bake", icon='KEY_HLT')
         else:
-            primary.enabled = is_mario_running()
+            primary.enabled = control_status == LIVE_IDLE
             primary.operator(StartRecording_OT_Operator.bl_idname, text="Start Recording", icon='REC')
         if recorder.active or recorder.has_pending_samples:
             box.operator(CancelRecording_OT_Operator.bl_idname, text="Cancel Recording", icon='CANCEL')
 
         if recorder.active:
-            box.label(text="{} samples · {:.2f} seconds".format(
+            box.label(text="{} samples Â· {:.2f} seconds".format(
                 recorder.sample_count, recorder.duration_seconds
             ))
         if recorder.sample_count >= 300:
@@ -228,7 +286,7 @@ class Main_PT_Panel(bpy.types.Panel):
         if _confirmation_message:
             box.label(text=_confirmation_message, icon='CHECKMARK')
         end_row = box.row()
-        end_row.enabled = is_mario_running()
+        end_row.enabled = has_owned_native_session()
         end_row.operator(EndMarioControl_OT_Operator.bl_idname, text="End Mario Control")
 
         takes = iter_takes()
@@ -307,7 +365,7 @@ def draw_take_row(layout, obj, is_current=False):
 class InsertMario_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_insert_mario"
     bl_label = "Insert Mario"
-    bl_description = "Inserts a Mario into the scene"
+    bl_description = "Insert Mario and begin continuous live control for rehearsal and recording"
 
     def execute(self, context):
         scene = context.scene
@@ -324,12 +382,12 @@ class InsertMario_OT_Operator(bpy.types.Operator):
 class ControlMario_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_control_mario"
     bl_label = "Control with keyboard"
-    bl_description = "Control Mario with keyboard"
+    bl_description = "Control Live Mario with the keyboard during rehearsal or recording"
 
     def invoke(self, context, event):
         global config
         config["keyboard_control"] = True
-        if 'LibSM64 Mario' not in bpy.data.objects:
+        if not is_mario_running():
             self.report({"ERROR"}, 'Insert Mario first.')
             return {'CANCELLED'}
         context.window_manager.modal_handler_add(self)
@@ -350,25 +408,24 @@ class ControlMario_OT_Operator(bpy.types.Operator):
 class StartRecording_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_start_recording"
     bl_label = "Start Recording"
-    bl_description = "Capture one complete Mario mesh snapshot per libsm64 tick"
+    bl_description = "Start capturing 30 Hz geometry from Live Mario's exact current position"
 
     def execute(self, context):
         global _recording_start_mark
         if not is_mario_running():
-            self.report({'ERROR'}, "Insert Mario and keep the simulation running first")
+            self.report({'ERROR'}, "Live Mario is not available for recording")
             return {'CANCELLED'}
+        previous_mark = _recording_start_mark
+        had_pending_samples = recorder.has_pending_samples
         try:
-            _recording_start_mark = capture_mario_starting_mark()
-            resume_mario_for_recording()
-            recorder.start(
-                float(context.scene.frame_current),
-                get_simulation_target_fps(context.scene),
-            )
+            _recording_start_mark = begin_mario_recording(context.scene)
         except Exception as exc:
-            _recording_start_mark = None
-            if is_mario_running():
-                pause_mario_for_review()
-            recorder.fail("Could not start recording: {}".format(exc), preserve_samples=False)
+            abandon_bake_transition()
+            _recording_start_mark = previous_mark if had_pending_samples else None
+            recorder.fail(
+                "Could not start recording: {}".format(exc),
+                preserve_samples=had_pending_samples,
+            )
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
         self.report({'INFO'}, "Recording Mario geometry")
@@ -386,12 +443,8 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
         global _recording_start_mark
         source_object = get_live_mario_object()
         try:
-            samples = recorder.freeze_for_bake()
+            samples = freeze_mario_recording_for_bake()
         except RecordingError as exc:
-            try:
-                pause_mario_for_review()
-            except Exception:
-                pass
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
@@ -406,10 +459,7 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
         except Exception as exc:
             if baked_object is not None:
                 discard_baked_take(baked_object)
-            try:
-                pause_mario_for_review()
-            except Exception:
-                pass
+            abandon_bake_transition()
             recorder.fail("Bake failed: {}".format(exc), preserve_samples=True)
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
@@ -430,21 +480,17 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
         try:
             if _recording_start_mark is None:
                 raise RuntimeError("The recording starting mark is unavailable")
-            restore_mario_starting_mark(_recording_start_mark)
-            pause_mario_for_review()
+            resume_live_idle_after_transition(_recording_start_mark)
         except Exception as exc:
-            try:
-                pause_mario_for_review()
-            except Exception:
-                pass
+            abandon_bake_transition()
             _recording_start_mark = None
             self.report(
                 {'ERROR'},
-                "{} was captured, but Live Mario reset failed: {}".format(label, exc),
+                "{} was captured, but Live Mario is unavailable: {}".format(label, exc),
             )
             return {'FINISHED'}
         _recording_start_mark = None
-        _show_confirmation("✓ Take {:03d} captured".format(take_number))
+        _show_confirmation("âœ“ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
             "Baked {} Mario samples to {}".format(sample_count, label),
@@ -455,7 +501,7 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
 class CancelRecording_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_cancel_recording"
     bl_label = "Cancel Recording"
-    bl_description = "Discard the pending take without stopping the live Mario simulation"
+    bl_description = "Discard the pending take, restore its start mark, and keep Live Mario controllable"
 
     def execute(self, context):
         global _recording_start_mark
@@ -464,11 +510,12 @@ class CancelRecording_OT_Operator(bpy.types.Operator):
         _recording_start_mark = None
         if mark is not None and is_mario_running():
             try:
-                restore_mario_starting_mark(mark)
+                resume_live_idle_after_transition(mark)
             except Exception as exc:
-                self.report({'ERROR'}, "Recording discarded, but Mario reset failed: {}".format(exc))
-            finally:
-                pause_mario_for_review()
+                self.report({'ERROR'}, "Recording discarded, but Live Mario is unavailable: {}".format(exc))
+                return {'CANCELLED'}
+        else:
+            abandon_bake_transition()
         self.report({'INFO'}, "Mario recording discarded")
         return {'FINISHED'}
 
@@ -561,6 +608,9 @@ class EndMarioControl_OT_Operator(bpy.types.Operator):
         recorder.cancel("Mario control ended")
         _recording_start_mark = None
         stop_tick_mario()
+        config["keyboard_control"] = False
+        for key in input_value:
+            input_value[key] = False
         live_object = get_live_mario_object()
         if live_object is not None:
             bpy.data.objects.remove(live_object, do_unlink=True)

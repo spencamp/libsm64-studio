@@ -58,6 +58,11 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(self.recorder.sample_count, 1)
         self.assertFalse(self.recorder.has_pending_samples)
 
+    def test_idle_ticks_do_not_capture_samples(self):
+        self.assertFalse(self.recorder.capture_mesh(self.mesh, 1))
+        self.assertEqual(self.recorder.sample_count, 0)
+        self.assertEqual(self.recorder.status, self.recorder.IDLE)
+
     def test_duplicate_sample_is_ignored(self):
         self.recorder.start(1, 30)
         self.assertTrue(self.recorder.capture_mesh(self.mesh, 4))
@@ -76,6 +81,29 @@ class RecorderTests(unittest.TestCase):
         self.recorder.cancel()
         self.assertEqual(self.recorder.status, self.recorder.IDLE)
         self.assertEqual(self.recorder.sample_count, 0)
+
+    def test_second_recording_starts_with_fresh_timing_and_sample_origin(self):
+        self.recorder.start(10, 24)
+        self.recorder.capture_mesh(self.mesh, 100)
+        self.recorder.freeze_for_bake()
+        self.recorder.complete("Take 001")
+
+        self.recorder.start(80, 60)
+        self.assertEqual(self.recorder.start_frame, 80.0)
+        self.assertEqual(self.recorder.target_fps, 60.0)
+        self.assertEqual(self.recorder.sample_count, 0)
+        self.assertIsNone(self.recorder.last_sample_id)
+        self.assertTrue(self.recorder.capture_mesh(self.mesh, 100))
+
+    def test_bake_failure_can_preserve_samples_until_explicit_cancel(self):
+        self.recorder.start(1, 30)
+        self.recorder.capture_mesh(self.mesh, 1)
+        self.recorder.fail("injected bake failure", preserve_samples=True)
+        self.assertFalse(self.recorder.active)
+        self.assertTrue(self.recorder.has_pending_samples)
+        self.recorder.cancel()
+        self.assertFalse(self.recorder.has_pending_samples)
+        self.assertEqual(self.recorder.status, self.recorder.IDLE)
 
 
 if __name__ == "__main__":

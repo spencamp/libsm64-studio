@@ -4,6 +4,10 @@ from . import zeth_inputs
 thread_running = False
 events = []
 
+
+def clear_input_reader_state():
+    del events[:]
+
 def _input_reader_thread():
     global thread_running
     global events
