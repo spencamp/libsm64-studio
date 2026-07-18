@@ -60,7 +60,7 @@ if configured_install:
     addon = importlib.import_module("libsm64_studio")
     mario = importlib.import_module("libsm64_studio.mario")
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-    assert mario.RUNTIME_API_VERSION == 4
+    assert mario.RUNTIME_API_VERSION == 5
     assert_init_import_contract(expected_package)
     assert addon.BAKING == mario.BAKING
     assert addon.POISONED == mario.POISONED
@@ -103,7 +103,7 @@ else:
             addon = importlib.reload(addon)
             mario = importlib.import_module("libsm64_studio.mario")
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-            assert mario.RUNTIME_API_VERSION == 4
+            assert mario.RUNTIME_API_VERSION == 5
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
         finally:

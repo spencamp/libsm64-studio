@@ -24,7 +24,7 @@ from libsm64_studio import take_manager as takes
 if installed_test:
     expected_root = Path(os.environ["LIBSM64_EXPECTED_INSTALL_ROOT"]).resolve()
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.5.1+static-collision"
+    assert addon.BUILD_ID == "2.6.0+libsm64-fd118132"
 
 
 LOCAL_POSE = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)

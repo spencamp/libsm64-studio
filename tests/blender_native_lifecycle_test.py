@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.5.1+static-collision"
+    assert addon.BUILD_ID == "2.6.0+libsm64-fd118132"
 
 
 class NativeCall:
@@ -48,6 +48,7 @@ class FakeLibrary:
         self.sm64_mario_create = NativeCall("mario_create", result=create_result)
         self.sm64_mario_delete = NativeCall("mario_delete", failure=delete_failure)
         self.sm64_mario_tick = NativeCall("mario_tick")
+        self.sm64_set_mario_faceangle = NativeCall("set_faceangle")
 
     def counts(self):
         return {
@@ -148,6 +149,78 @@ assert "supported" in wrong_error.lower()
 assert not libraries
 mario._read_validated_rom = original_validator
 
+# The exact pinned header layout is validated before even resolving a library.
+assert mario.ct.sizeof(mario.SM64Surface) == 44
+assert mario.SM64Surface.vertices.offset == 8
+assert mario.ct.sizeof(mario.SM64MarioInputs) == 20
+assert mario.ct.sizeof(mario.SM64MarioState) == 60
+for field_name, expected_offset in {
+    "position": 0,
+    "velocity": 12,
+    "faceAngle": 24,
+    "forwardVelocity": 28,
+    "health": 32,
+    "action": 36,
+    "animID": 40,
+    "animFrame": 44,
+    "flags": 48,
+    "particleFlags": 52,
+    "invincTimer": 56,
+}.items():
+    assert getattr(mario.SM64MarioState, field_name).offset == expected_offset
+mario._validate_ctypes_abi_layout()
+
+class WrongMarioState(mario.ct.Structure):
+    _fields_ = [("position", mario.ct.c_float * 3)]
+
+original_state_type = mario.SM64MarioState
+mario.SM64MarioState = WrongMarioState
+abi_unused = FakeLibrary()
+libraries.append(abi_unused)
+abi_error = mario.insert_mario("mock.z64", 100, False)
+assert "SM64MarioState" in abi_error
+assert mario.PINNED_LIBSM64_COMMIT in abi_error
+assert "reinstall" in abi_error.lower()
+assert libraries.pop() is abi_unused
+assert abi_unused.counts() == {
+    "global_init": 0, "global_terminate": 0, "mario_create": 0, "mario_delete": 0,
+}
+mario.SM64MarioState = original_state_type
+assert_idle()
+
+# Every Phase-1 export, including the face setter, is required before init.
+missing_export = FakeLibrary()
+del missing_export.sm64_set_mario_faceangle
+missing_error = insert_with(missing_export)
+assert "sm64_set_mario_faceangle" in missing_error
+assert missing_export.counts() == {
+    "global_init": 0, "global_terminate": 0, "mario_create": 0, "mario_delete": 0,
+}
+assert_idle()
+
+# Provenance/hash rejection occurs before LoadLibrary and before any fake call.
+real_native_loader = mario._load_native_library
+native_manifest = mario._read_native_build_manifest()
+with tempfile.TemporaryDirectory() as directory:
+    Path(directory, "sm64.dll").write_bytes(b"stale native artifact")
+    mario._load_native_library = lambda: mario._verify_native_artifact(
+        native_manifest, directory, "Windows"
+    )
+    hash_unused = FakeLibrary()
+    libraries.append(hash_unused)
+    hash_error = mario.insert_mario("mock.z64", 100, False)
+    assert "SHA-256" in hash_error
+    assert mario.PINNED_LIBSM64_COMMIT in hash_error
+    assert libraries.pop() is hash_unused
+    assert hash_unused.counts() == {
+        "global_init": 0,
+        "global_terminate": 0,
+        "mario_create": 0,
+        "mario_delete": 0,
+    }
+mario._load_native_library = real_native_loader
+assert_idle()
+
 # Insert twice: the first session is deleted/terminated exactly once before
 # the second generation initializes.
 first = FakeLibrary()
@@ -155,12 +228,27 @@ second = FakeLibrary(create_result=11)
 libraries.extend((first, second))
 assert mario.insert_mario("mock.z64", 100, False) is None
 assert first.sm64_global_init.restype is None
-assert len(first.sm64_global_init.argtypes) == 3
+assert first.sm64_global_init.argtypes == [
+    mario.ct.POINTER(mario.ct.c_uint8), mario.ct.POINTER(mario.ct.c_uint8),
+]
 assert first.sm64_global_terminate.argtypes == []
 assert first.sm64_global_terminate.restype is None
+assert first.sm64_static_surfaces_load.argtypes == [
+    mario.ct.POINTER(mario.SM64Surface), mario.ct.c_uint32,
+]
+assert first.sm64_mario_create.argtypes == [
+    mario.ct.c_float, mario.ct.c_float, mario.ct.c_float,
+]
 assert first.sm64_mario_create.restype is mario.ct.c_int32
+assert first.sm64_mario_delete.argtypes == [mario.ct.c_int32]
 assert first.sm64_mario_delete.restype is None
+assert first.sm64_mario_tick.argtypes[0] is mario.ct.c_int32
 assert first.sm64_mario_tick.restype is None
+assert first.sm64_set_mario_faceangle.argtypes == [mario.ct.c_int32, mario.ct.c_float]
+assert first.sm64_set_mario_faceangle.restype is None
+assert len(first.sm64_global_init.calls[0]) == 2
+assert first.sm64_mario_create.calls[0] == (0.0, 0.0, 0.0)
+assert all(isinstance(value, float) for value in first.sm64_mario_create.calls[0])
 assert mario.insert_mario("mock.z64", 100, False) is None
 assert first.counts() == {
     "global_init": 1, "global_terminate": 1, "mario_create": 1, "mario_delete": 1,

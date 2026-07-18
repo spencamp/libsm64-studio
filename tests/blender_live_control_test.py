@@ -46,6 +46,7 @@ class FakeLibrary:
         self.sm64_mario_create = NativeCall(mario_id, name="mario_create", events=self.events)
         self.sm64_mario_delete = NativeCall(name="mario_delete", events=self.events)
         self.sm64_mario_tick = NativeCall()
+        self.sm64_set_mario_faceangle = NativeCall()
 
 
 libraries = []
@@ -104,12 +105,10 @@ assert not recorder.active and recorder.sample_count == 0
 
 # A persistent mark is deliberate; recording captures only later ticks and does
 # not replace it.
-mario.mario_state.posX = 123.25
-mario.mario_state.posY = 456.5
-mario.mario_state.posZ = -78.75
+mario.mario_state.position[:] = (123.25, 456.5, -78.75)
 mark = mario.set_persistent_start_mark()
 assert mark["position"] == (123.25, 456.5, -78.75)
-mario.mario_state.posX = 321.0
+mario.mario_state.position[0] = 321.0
 mario.begin_mario_recording(scene)
 assert mario._valid_persistent_start_mark()["position"] == (123.25, 456.5, -78.75)
 assert recorder.start_frame == 41.0
@@ -124,7 +123,9 @@ timer()
 assert recorder.sample_count == 1
 same_tick_sample = recorder.samples[0]
 assert same_tick_sample.world_location == mario.native_position_to_blender(
-    mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ
+    mario.mario_state.position[0],
+    mario.mario_state.position[1],
+    mario.mario_state.position[2],
 )
 assert same_tick_sample.face_angle == float(mario.mario_state.faceAngle)
 samples = mario.freeze_mario_recording_for_bake()
@@ -133,15 +134,14 @@ recorder.complete("Take 001")
 mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
 assert session.timer_callback is timer and bpy.app.timers.is_registered(timer)
-assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
+assert first.sm64_mario_create.calls[-1] == (123.25, 456.5, -78.75)
+assert len(first.sm64_set_mario_faceangle.calls) == 1
 assert all(not value for value in addon.input_value.values())
 assert scene.render.fps == 24 and math.isclose(scene.render.fps_base, 1.001, rel_tol=1e-6)
 
 # No resume/reinsert is needed for a second take, and cancel restores the
 # persistent mark rather than the position where that take began.
-mario.mario_state.posX = 9.0
-mario.mario_state.posY = 8.0
-mario.mario_state.posZ = 7.0
+mario.mario_state.position[:] = (9.0, 8.0, 7.0)
 mario.begin_mario_recording(scene)
 timer()
 assert recorder.sample_count == 1
@@ -149,7 +149,8 @@ recorder.cancel()
 mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
 assert bpy.app.timers.is_registered(timer)
-assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
+assert first.sm64_mario_create.calls[-1] == (123.25, 456.5, -78.75)
+assert len(first.sm64_set_mario_faceangle.calls) == 2
 
 # A failed bake can retain samples while live control safely returns to idle.
 mario.begin_mario_recording(scene)

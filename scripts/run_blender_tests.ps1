@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$BlenderPath = "C:\Program Files (x86)\Steam\steamapps\common\Blender\5.2\blender.exe",
+    [string]$RomPath = $env:LIBSM64_TEST_ROM,
     [switch]$KeepTemp,
     [switch]$SmokeOnly
 )
@@ -39,7 +40,7 @@ $isolatedVariables = @(
     "BLENDER_USER_CONFIG", "BLENDER_USER_SCRIPTS", "BLENDER_USER_DATAFILES",
     "BLENDER_USER_EXTENSIONS", "LIBSM64_ADDON_ZIP",
     "LIBSM64_EXPECTED_INSTALL_ROOT", "LIBSM64_TEST_INSTALLED",
-    "LIBSM64_BLENDER_TEST", "TEMP", "TMP"
+    "LIBSM64_BLENDER_TEST", "LIBSM64_TEST_ROM", "TEMP", "TMP"
 )
 
 function Assert-MirrorFile([string]$Name) {
@@ -119,10 +120,32 @@ try {
         throw "Could not stage packaged add-on files (a file may be locked): $($_.Exception.Message)"
     }
 
-    foreach ($required in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "lib\sm64.dll", "lib\SDL2.dll")) {
+    foreach ($required in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "lib\libsm64-build.json", "lib\sm64.dll", "lib\libsm64.so", "lib\SDL2.dll")) {
         if (-not (Test-Path -LiteralPath (Join-Path $stagedPackage $required) -PathType Leaf)) {
             throw "Staged add-on is missing required file: libsm64_studio\$required"
         }
+    }
+
+    $nativeManifestPath = Join-Path $stagedPackage "lib\libsm64-build.json"
+    $nativeManifest = Get-Content -LiteralPath $nativeManifestPath -Raw | ConvertFrom-Json
+    $pinnedCommit = "fd11813208272b4271d92bd92feb8f3fdbe61be5"
+    if ($nativeManifest.repository -ne "libsm64/libsm64" -or $nativeManifest.commit -ne $pinnedCommit -or $nativeManifest.header -ne "src/libsm64.h") {
+        throw "Staged native build manifest does not name the pinned repository/header/commit"
+    }
+    foreach ($artifactName in @("sm64.dll", "libsm64.so")) {
+        $artifactPath = Join-Path $stagedPackage ("lib\" + $artifactName)
+        $expectedHash = $nativeManifest.artifacts.$artifactName.sha256
+        $actualHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+            throw "Staged native hash mismatch for $artifactName`: expected $expectedHash, actual $actualHash"
+        }
+    }
+    $sm64NativeNames = @(Get-ChildItem -LiteralPath (Join-Path $stagedPackage "lib") -File | Where-Object {
+        $_.Name.ToLowerInvariant().Contains("sm64")
+    } | ForEach-Object { $_.Name })
+    $expectedNativeNames = @("libsm64-build.json", "libsm64.so", "sm64.dll")
+    if (Compare-Object -ReferenceObject $expectedNativeNames -DifferenceObject $sm64NativeNames) {
+        throw "Staged package contains an unexpected or stale libsm64 native artifact"
     }
 
     $marioSource = Get-Content -LiteralPath (Join-Path $stagedPackage "mario.py") -Raw
@@ -150,7 +173,7 @@ try {
         if ($entryDifference) {
             throw "Generated add-on ZIP contents differ from the staged install: $($entryDifference | Out-String)"
         }
-        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/SDL2.dll")) {
+        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/lib/libsm64-build.json", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/libsm64.so", "libsm64_studio/lib/SDL2.dll")) {
             if ($entries -notcontains $required) {
                 throw "Generated add-on ZIP is missing $required"
             }
@@ -187,10 +210,29 @@ try {
     $env:LIBSM64_EXPECTED_INSTALL_ROOT = $installedPackage
     $env:LIBSM64_TEST_INSTALLED = "1"
     $env:LIBSM64_BLENDER_TEST = "1"
+    if ($RomPath) {
+        $resolvedRom = [System.IO.Path]::GetFullPath($RomPath)
+        if (-not (Test-Path -LiteralPath $resolvedRom -PathType Leaf)) {
+            throw "ROM-backed native test ROM was not found: $resolvedRom"
+        }
+        $romSha1 = (Get-FileHash -LiteralPath $resolvedRom -Algorithm SHA1).Hash.ToLowerInvariant()
+        if ($romSha1 -ne "9bef1128717f958171a4afac3ed78ee2bb4e86ce") {
+            throw "-RomPath is not the supported unmodified SM64 US ROM"
+        }
+        $env:LIBSM64_TEST_ROM = $resolvedRom
+    } else {
+        Remove-Item Env:LIBSM64_TEST_ROM -ErrorAction SilentlyContinue
+    }
     $env:TEMP = $runRoot
     $env:TMP = $runRoot
 
     Invoke-BlenderTest "packaged add-on smoke" (Join-Path $repoRoot "tests\blender_packaged_import_test.py")
+    Invoke-BlenderTest "real native ABI smoke" (Join-Path $repoRoot "tests\blender_native_abi_smoke_test.py")
+    if ($RomPath) {
+        Invoke-BlenderTest "ROM-backed native subprocess lifecycle" (Join-Path $repoRoot "tests\blender_native_rom_subprocess_test.py")
+    } else {
+        Write-Warning "ROM-backed native subprocess lifecycle was not run; pass -RomPath or set LIBSM64_TEST_ROM."
+    }
     if (-not $SmokeOnly) {
         Invoke-BlenderTest "bulk mesh update regression" (Join-Path $repoRoot "tests\blender_mesh_update_test.py")
         Invoke-BlenderTest "static collision regression" (Join-Path $repoRoot "tests\blender_static_collision_test.py")

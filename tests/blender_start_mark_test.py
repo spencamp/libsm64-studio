@@ -41,6 +41,7 @@ class FakeLibrary:
         self.sm64_mario_create = NativeCall(mario_id)
         self.sm64_mario_delete = NativeCall()
         self.sm64_mario_tick = NativeCall()
+        self.sm64_set_mario_faceangle = NativeCall()
 
 
 class Reporter:
@@ -92,29 +93,33 @@ insert_with(library)
 assert not mario.has_valid_start_mark()
 
 # Setting captures public state without moving or recreating Mario; setting again replaces it.
-mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ = (10.25, 20.5, -30.75)
+mario.mario_state.position[:] = (10.25, 20.5, -30.75)
+mario.mario_state.velocity[:] = (1.25, -2.5, 3.75)
 native_counts = (len(library.sm64_mario_delete.calls), len(library.sm64_mario_create.calls))
 first_mark = mario.set_persistent_start_mark()
 assert first_mark["position"] == (10.25, 20.5, -30.75)
+assert first_mark["velocity"] == (1.25, -2.5, 3.75)
 assert native_counts == (len(library.sm64_mario_delete.calls), len(library.sm64_mario_create.calls))
 assert mario.has_valid_start_mark()
 
-mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ = (90.0, 80.0, 70.0)
+mario.mario_state.position[:] = (40000.25, -40001.5, 70.75)
+mario.mario_state.faceAngle = -1.25
 second_mark = mario.set_persistent_start_mark()
-assert second_mark["position"] == (90.0, 80.0, 70.0)
-assert mario._valid_persistent_start_mark()["position"] == (90.0, 80.0, 70.0)
+assert second_mark["position"] == (40000.25, -40001.5, 70.75)
+assert mario._valid_persistent_start_mark()["position"] == (40000.25, -40001.5, 70.75)
 
 # Manual reset recreates native Mario, updates the mesh, and returns to controllable idle.
 mario.reset_to_persistent_start_mark()
-assert library.sm64_mario_create.calls[-1] == (90, 80, 70)
+assert library.sm64_mario_create.calls[-1] == (40000.25, -40001.5, 70.75)
+assert library.sm64_set_mario_faceangle.calls[-1] == (library.sm64_mario_create.result, -1.25)
 assert mario.live_control_status() == mario.LIVE_IDLE
 
 # Recording from the current position does not reset or replace the persistent mark.
 create_count = len(library.sm64_mario_create.calls)
-mario.mario_state.posX = 999.0
+mario.mario_state.position[0] = 999.0
 mario.begin_mario_recording(scene, reset_to_mark=False)
 assert len(library.sm64_mario_create.calls) == create_count
-assert mario._valid_persistent_start_mark()["position"] == (90.0, 80.0, 70.0)
+assert mario._valid_persistent_start_mark()["position"] == (40000.25, -40001.5, 70.75)
 assert not addon.ResetToStartMark_OT_Operator.poll(context)
 recorder.cancel()
 mario.return_to_start_mark_after_transition()
@@ -176,7 +181,9 @@ assert mario.live_control_status() == mario.LIVE_IDLE
 sample = PerformanceSample(
     array('f', [0.0] * (len(mario.get_live_mario_object().data.vertices) * 3)),
     mario.native_position_to_blender(
-        mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ
+        mario.mario_state.position[0],
+        mario.mario_state.position[1],
+        mario.mario_state.position[2],
     ),
     float(mario.mario_state.faceAngle),
 )
@@ -277,7 +284,7 @@ assert not mario.has_valid_start_mark()
 mario._lifecycle.persistent_start_mark = old_stored_mark
 assert not mario.has_valid_start_mark()
 mario._lifecycle.persistent_start_mark = None
-mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ = (1.0, 2.0, 3.0)
+mario.mario_state.position[:] = (1.0, 2.0, 3.0)
 mario.set_persistent_start_mark()
 mario.stop_tick_mario()
 assert mario._lifecycle.persistent_start_mark is None

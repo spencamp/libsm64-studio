@@ -37,6 +37,13 @@ ZIP. Blender may overlay same-name add-ons without removing obsolete modules or
 bytecode, which can create a mixed-file installation. The add-on now detects that
 state and asks for a clean reinstall.
 
+This release targets the modern `libsm64/libsm64` ABI pinned at the exact
+upstream commit `fd11813208272b4271d92bd92feb8f3fdbe61be5`. Both bundled
+libraries, the Python declarations, and the generated C ABI probe data refer to
+that same header revision. At runtime Studio validates the manifest, artifact
+SHA-256, structure layout, required exports, and function signatures before any
+libsm64 initialization call.
+
 ## Start a studio session
 
 Before opening Blender, connect an XInput controller to perform with one;
@@ -53,8 +60,10 @@ cleanup.
 **Start Live Mario** extracts eligible scene meshes and loads one static collision
 set before Mario is created. That collision remains unchanged until the Studio
 Session ends. Large scenes can therefore take longer to initialize, and geometry
-outside the native signed 16-bit coordinate range relative to the 3D cursor is
-clamped or omitted by the established whole-scene conversion path.
+outside the native signed 32-bit coordinate range relative to the 3D cursor is
+omitted with a diagnostic. The modern fields remove the old ABI's signed-16-bit
+coordinate restriction; this does not imply unlimited scene size or guarantee
+native broadphase behavior at every scale.
 
 ## Capture a Mario performance
 
@@ -151,11 +160,35 @@ overlap after a reset, move Live Mario to continue rehearsing or hide it manuall
 
 ### Automated Blender CLI tests
 
+Run the ordinary Python suite first:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
 From the repository root, build and test the installable add-on with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_blender_tests.ps1
 ```
+
+To include the crash-isolated native lifecycle gate, provide an unmodified SM64
+US ROM. The parent Blender launches a second background Blender process, so an
+access violation in `sm64.dll` cannot terminate the suite runner:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_blender_tests.ps1 `
+  -RomPath C:\path\to\sm64.us.z64
+```
+
+The child validates the packaged manifest/hash and ctypes layouts before DLL
+load, validates the ROM SHA-1, allocates the exact texture buffer, then exercises
+global initialization, static collision load, Mario creation, one tick, Mario
+deletion, and global termination. Every native boundary is printed with
+`LIBSM64_NATIVE_STAGE` and flushed immediately. Global termination is never
+called when initialization did not return successfully. The runner warns and
+omits this ROM-backed gate when neither `-RomPath` nor `LIBSM64_TEST_ROM` is set;
+ROM files are never staged or added to the package.
 
 The runner defaults to the Steam Blender 5.2 installation at
 `C:\Program Files (x86)\Steam\steamapps\common\Blender\5.2\blender.exe`. Override
@@ -174,10 +207,47 @@ profile, opens an existing `.blend`, or attaches to another Blender process.
 
 The automated suite covers packaged add-on import and lifecycle registration,
 timer-driven live control, persistent Start Mark transitions and ownership,
-native lifecycle ownership, and the three-take regression. The controller feel,
+native lifecycle ownership, real bundled-library ABI loading without a ROM,
+the optional crash-isolated ROM-backed native lifecycle, whole-scene 32-bit
+collision conversion, and the three-take regression. The controller feel,
 viewport redraw/appearance, material preview,
 Eevee/Cycles rendering, and interactive playback/scrubbing checks below still
 require a normal GUI Blender session.
+
+### Rebuilding the native libraries
+
+See [the pinned native build guide](docs/native-build.md). The build script
+clones or fetches the official repository, refuses a dirty or different
+revision, runs upstream's `make lib` target for Windows and Linux, compiles a
+small ABI probe against the pinned `src/libsm64.h`, copies only `sm64.dll` and
+`libsm64.so`, and writes their SHA-256 values to
+`libsm64_studio/lib/libsm64-build.json`. Packaging and runtime validation
+recalculate those hashes. Never place a ROM, upstream test executable, or
+generated upstream build directory in the add-on.
+
+The current bundled hashes are:
+
+- `sm64.dll`: `6f51ec90ef15d2eead509cfcd863162416f24541cf16e94bbd138526cddf873f`
+- `libsm64.so`: `44a586475df7254f272d20a969e6a25442834f1cc1427c7b40c0ec5592257656`
+
+### Phase 1 manual acceptance
+
+After all automated tests pass, perform this check in a normal Blender session:
+
+1. Clean-install the generated add-on ZIP.
+2. Start Blender 5.2 with a valid SM64 US ROM.
+3. Start Live Mario over simple collision and confirm normal texture and controls.
+4. Move beyond the old signed-16-bit collision-coordinate range in a suitable scene.
+5. Set and reset a Start Mark.
+6. Record a short run with turns and a jump, then bake it.
+7. Confirm object-transform movement and Mario-local pose shape keys still work.
+8. Record a second take and verify the first remains unchanged.
+9. End the Studio Session, then start and end another session.
+10. Confirm there is no Blender crash, duplicate native cleanup, or stale timer.
+11. Save and reopen the file; confirm baked takes remain independent of the native runtime.
+
+Record the platform, Blender build, package hash, and result separately. Do not
+treat this checklist as performed merely because the automated suite passed.
 
 Run the following for each target FPS you need to validate (especially 24, 30,
 and 60):
@@ -247,12 +317,18 @@ single packed image from the ROM; it does not create a texture per take.
 - Render and reopen baked performances without libsm64, a ROM, or a controller.
 - Use Fast64 terrain and collision metadata when it is present in a scene.
 
+Phase 1 remains compatibility-only: collision is still one whole-scene static
+load. Dynamic surface objects, moving platforms, water/gas controls, cap
+controls, audio, richer Start Mark restoration, damage/health controls,
+collision queries, and an armature are not implemented.
+
 ## Planned capabilities
 
 ### Near term
 
 - Water and liquid interaction for more varied performances.
 - Wing, Metal, and Vanish Cap controls for performance direction.
+- Audio integration.
 - Additional take-review and camera-framing tools.
 
 ### Longer term

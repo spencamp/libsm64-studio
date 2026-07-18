@@ -1,6 +1,7 @@
 import bpy
 from array import array
 import hashlib
+import json
 import os
 import platform
 import ctypes as ct
@@ -30,6 +31,8 @@ EXPECTED_ROM_SHA1 = "9bef1128717f958171a4afac3ed78ee2bb4e86ce"
 LIFECYCLE_REGISTRY_KEY = "libsm64_studio_native_lifecycle"
 SIMULATION_FPS = 30.0
 SIMULATION_INTERVAL = 1.0 / SIMULATION_FPS
+PINNED_LIBSM64_COMMIT = "fd11813208272b4271d92bd92feb8f3fdbe61be5"
+NATIVE_STAGE_PREFIX = "LIBSM64_NATIVE_STAGE"
 
 STOPPED = "STOPPED"
 LIVE_IDLE = "LIVE_IDLE"
@@ -44,31 +47,41 @@ original_fps_setting = 0
 original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
 simulation_scene = None
-RUNTIME_API_VERSION = 4
+RUNTIME_API_VERSION = 5
+
+SM64SurfaceVertex = ct.c_int32 * 3
+SM64SurfaceVertices = SM64SurfaceVertex * 3
 
 class SM64Surface(ct.Structure):
     _fields_ = [
-        ('surftype', ct.c_int16),
+        ('type', ct.c_int16),
         ('force', ct.c_int16),
         ('terrain', ct.c_uint16),
-        ('v0x', ct.c_int16), ('v0y', ct.c_int16), ('v0z', ct.c_int16),
-        ('v1x', ct.c_int16), ('v1y', ct.c_int16), ('v1z', ct.c_int16),
-        ('v2x', ct.c_int16), ('v2y', ct.c_int16), ('v2z', ct.c_int16)
+        ('vertices', SM64SurfaceVertices),
     ]
 
 class SM64MarioInputs(ct.Structure):
     _fields_ = [
         ('camLookX', ct.c_float), ('camLookZ', ct.c_float),
         ('stickX', ct.c_float), ('stickY', ct.c_float),
-        ('buttonA', ct.c_ubyte), ('buttonB', ct.c_ubyte), ('buttonZ', ct.c_ubyte),
+        ('buttonA', ct.c_uint8), ('buttonB', ct.c_uint8), ('buttonZ', ct.c_uint8),
     ]
+
+Float3 = ct.c_float * 3
 
 class SM64MarioState(ct.Structure):
     _fields_ = [
-        ('posX', ct.c_float), ('posY', ct.c_float), ('posZ', ct.c_float),
-        ('velX', ct.c_float), ('velY', ct.c_float), ('velZ', ct.c_float),
+        ('position', Float3),
+        ('velocity', Float3),
         ('faceAngle', ct.c_float),
+        ('forwardVelocity', ct.c_float),
         ('health', ct.c_int16),
+        ('action', ct.c_uint32),
+        ('animID', ct.c_int32),
+        ('animFrame', ct.c_int16),
+        ('flags', ct.c_uint32),
+        ('particleFlags', ct.c_uint32),
+        ('invincTimer', ct.c_int16),
     ]
 
 class SM64MarioGeometryBuffers(ct.Structure):
@@ -96,6 +109,119 @@ class SM64MarioGeometryBuffers(ct.Structure):
 
 class MarioLifecycleError(RuntimeError):
     pass
+
+
+def _native_stage(stage):
+    """Emit a crash-resilient native boundary marker for console/subprocess logs."""
+    print("{} {}".format(NATIVE_STAGE_PREFIX, stage), flush=True)
+
+
+def _abi_layout_failure(subject, expected, actual):
+    raise MarioLifecycleError(
+        "libsm64 ABI layout mismatch for {}: expected {}, actual {}. "
+        "The packaged native ABI is pinned to upstream commit {}. "
+        "Disable the add-on, remove the installed libsm64_studio directory, "
+        "and reinstall a clean matching package.".format(
+            subject, expected, actual, PINNED_LIBSM64_COMMIT
+        )
+    )
+
+
+def _validate_ctypes_abi_layout(structure_overrides=None):
+    """Reject ctypes declarations that do not match the pinned libsm64.h."""
+    structures = {
+        "SM64Surface": SM64Surface,
+        "SM64MarioInputs": SM64MarioInputs,
+        "SM64MarioState": SM64MarioState,
+        "SM64MarioGeometryBuffers": SM64MarioGeometryBuffers,
+    }
+    if structure_overrides:
+        structures.update(structure_overrides)
+
+    expected_fields = {
+        "SM64Surface": (
+            ('type', ct.c_int16),
+            ('force', ct.c_int16),
+            ('terrain', ct.c_uint16),
+            ('vertices', SM64SurfaceVertices),
+        ),
+        "SM64MarioInputs": (
+            ('camLookX', ct.c_float),
+            ('camLookZ', ct.c_float),
+            ('stickX', ct.c_float),
+            ('stickY', ct.c_float),
+            ('buttonA', ct.c_uint8),
+            ('buttonB', ct.c_uint8),
+            ('buttonZ', ct.c_uint8),
+        ),
+        "SM64MarioState": (
+            ('position', Float3),
+            ('velocity', Float3),
+            ('faceAngle', ct.c_float),
+            ('forwardVelocity', ct.c_float),
+            ('health', ct.c_int16),
+            ('action', ct.c_uint32),
+            ('animID', ct.c_int32),
+            ('animFrame', ct.c_int16),
+            ('flags', ct.c_uint32),
+            ('particleFlags', ct.c_uint32),
+            ('invincTimer', ct.c_int16),
+        ),
+        "SM64MarioGeometryBuffers": (
+            ('position', ct.POINTER(ct.c_float)),
+            ('normal', ct.POINTER(ct.c_float)),
+            ('color', ct.POINTER(ct.c_float)),
+            ('uv', ct.POINTER(ct.c_float)),
+            ('numTrianglesUsed', ct.c_uint16),
+        ),
+    }
+    for name, expected in expected_fields.items():
+        actual = tuple(getattr(structures[name], "_fields_", ()))
+        if actual != expected:
+            _abi_layout_failure("{} fields".format(name), expected, actual)
+
+    pointer_size = ct.sizeof(ct.c_void_p)
+    if pointer_size not in (4, 8):
+        _abi_layout_failure("native pointer size", "4 or 8 bytes", pointer_size)
+
+    expected_sizes = {
+        "SM64Surface": 44,
+        "SM64MarioInputs": 20,
+        "SM64MarioState": 60,
+        "SM64MarioGeometryBuffers": ((4 * pointer_size + 2 + pointer_size - 1)
+                                      // pointer_size * pointer_size),
+    }
+    expected_offsets = {
+        "SM64Surface": {
+            "type": 0, "force": 2, "terrain": 4, "vertices": 8,
+        },
+        "SM64MarioInputs": {
+            "camLookX": 0, "camLookZ": 4, "stickX": 8, "stickY": 12,
+            "buttonA": 16, "buttonB": 17, "buttonZ": 18,
+        },
+        "SM64MarioState": {
+            "position": 0, "velocity": 12, "faceAngle": 24,
+            "forwardVelocity": 28, "health": 32, "action": 36,
+            "animID": 40, "animFrame": 44, "flags": 48,
+            "particleFlags": 52, "invincTimer": 56,
+        },
+        "SM64MarioGeometryBuffers": {
+            "position": 0, "normal": pointer_size, "color": 2 * pointer_size,
+            "uv": 3 * pointer_size, "numTrianglesUsed": 4 * pointer_size,
+        },
+    }
+    for name, expected_size in expected_sizes.items():
+        actual_size = ct.sizeof(structures[name])
+        if actual_size != expected_size:
+            _abi_layout_failure("sizeof({})".format(name), expected_size, actual_size)
+        for field_name, expected_offset in expected_offsets[name].items():
+            actual_offset = getattr(structures[name], field_name).offset
+            if actual_offset != expected_offset:
+                _abi_layout_failure(
+                    "{}.{}.offset".format(name, field_name),
+                    expected_offset,
+                    actual_offset,
+                )
 
 
 class NativeLifecycle:
@@ -325,39 +451,208 @@ def _read_validated_rom(rom_path):
     return rom_bytes
 
 
+def _native_package_error(detail):
+    raise MarioLifecycleError(
+        "{} The native package must match pinned upstream commit {}. "
+        "Disable the add-on, remove the installed libsm64_studio directory, "
+        "and reinstall a clean matching package.".format(
+            detail, PINNED_LIBSM64_COMMIT
+        )
+    )
+
+
+def _read_native_build_manifest(lib_directory=None):
+    lib_directory = lib_directory or os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "lib"
+    )
+    manifest_path = os.path.join(lib_directory, "libsm64-build.json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, ValueError) as exc:
+        _native_package_error(
+            "Could not read the bundled native build manifest {}: {}.".format(
+                manifest_path, exc
+            )
+        )
+
+    expected_values = {
+        "repository": "libsm64/libsm64",
+        "commit": PINNED_LIBSM64_COMMIT,
+        "header": "src/libsm64.h",
+        "windows_artifact": "sm64.dll",
+        "linux_artifact": "libsm64.so",
+    }
+    for field_name, expected in expected_values.items():
+        actual = manifest.get(field_name) if isinstance(manifest, dict) else None
+        if actual != expected:
+            _native_package_error(
+                "Native build manifest field {} expected {!r}, actual {!r}.".format(
+                    field_name, expected, actual
+                )
+            )
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        _native_package_error("Native build manifest has no artifact hash table.")
+    for artifact_name in ("sm64.dll", "libsm64.so"):
+        metadata = artifacts.get(artifact_name)
+        artifact_hash = metadata.get("sha256") if isinstance(metadata, dict) else None
+        if not isinstance(artifact_hash, str) or len(artifact_hash) != 64:
+            _native_package_error(
+                "Native build manifest has no valid SHA-256 for {}.".format(
+                    artifact_name
+                )
+            )
+        try:
+            int(artifact_hash, 16)
+        except ValueError:
+            _native_package_error(
+                "Native build manifest SHA-256 for {} is not hexadecimal.".format(
+                    artifact_name
+                )
+            )
+    return manifest
+
+
+def _validate_manifest_abi_probe(manifest):
+    probe = manifest.get("abi_probe") if isinstance(manifest, dict) else None
+    if not isinstance(probe, dict):
+        _native_package_error("Native build manifest has no pinned-header ABI probe data.")
+    pointer_size = ct.sizeof(ct.c_void_p)
+    if probe.get("pointer_size") != pointer_size:
+        _abi_layout_failure(
+            "manifest ABI probe pointer_size", probe.get("pointer_size"), pointer_size
+        )
+    structures = {
+        "SM64Surface": SM64Surface,
+        "SM64MarioInputs": SM64MarioInputs,
+        "SM64MarioState": SM64MarioState,
+        "SM64MarioGeometryBuffers": SM64MarioGeometryBuffers,
+    }
+    for structure_name, structure in structures.items():
+        expected = probe.get(structure_name)
+        if not isinstance(expected, dict):
+            _native_package_error(
+                "Native build manifest ABI probe is missing {}.".format(structure_name)
+            )
+        actual_size = ct.sizeof(structure)
+        if expected.get("size") != actual_size:
+            _abi_layout_failure(
+                "manifest ABI probe sizeof({})".format(structure_name),
+                expected.get("size"),
+                actual_size,
+            )
+        for field_name, _field_type in structure._fields_:
+            actual_offset = getattr(structure, field_name).offset
+            if expected.get(field_name) != actual_offset:
+                _abi_layout_failure(
+                    "manifest ABI probe {}.{}.offset".format(
+                        structure_name, field_name
+                    ),
+                    expected.get(field_name),
+                    actual_offset,
+                )
+
+
+def _verify_native_artifact(manifest, lib_directory=None, system_name=None):
+    lib_directory = lib_directory or os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "lib"
+    )
+    system_name = system_name or platform.system()
+    if system_name == "Windows":
+        artifact_name = manifest["windows_artifact"]
+    elif system_name == "Linux":
+        artifact_name = manifest["linux_artifact"]
+    else:
+        _native_package_error(
+            "Unsupported native platform {!r}; Studio currently supports Windows "
+            "and Linux.".format(system_name)
+        )
+    artifact_path = os.path.join(lib_directory, artifact_name)
+    if not os.path.isfile(artifact_path):
+        _native_package_error("Bundled native artifact is missing: {}.".format(artifact_path))
+    digest = hashlib.sha256()
+    try:
+        with open(artifact_path, "rb") as artifact_file:
+            for block in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        _native_package_error(
+            "Could not hash bundled native artifact {}: {}.".format(artifact_path, exc)
+        )
+    expected_hash = manifest["artifacts"][artifact_name]["sha256"].lower()
+    actual_hash = digest.hexdigest()
+    if actual_hash != expected_hash:
+        _native_package_error(
+            "Bundled native artifact {} has SHA-256 {}, expected {}.".format(
+                artifact_name, actual_hash, expected_hash
+            )
+        )
+    return artifact_path
+
+
 def _load_native_library():
-    this_path = os.path.dirname(os.path.realpath(__file__))
-    dll_name = 'sm64.dll' if platform.system() == 'Windows' else 'libsm64.so'
-    return ct.cdll.LoadLibrary(os.path.join(this_path, 'lib', dll_name))
+    _validate_ctypes_abi_layout()
+    lib_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    manifest = _read_native_build_manifest(lib_directory)
+    _validate_manifest_abi_probe(manifest)
+    artifact_path = _verify_native_artifact(manifest, lib_directory)
+    _native_stage("before_dll_load")
+    try:
+        library = ct.cdll.LoadLibrary(artifact_path)
+    except OSError as exc:
+        _native_package_error(
+            "Could not load verified native artifact {}: {}.".format(
+                artifact_path, exc
+            )
+        )
+    _native_stage("after_dll_load")
+    return library
 
 
 def _configure_native_api(library):
-    """Configure the 2022 libsm64 ABI shipped in this repository."""
+    """Validate and configure the Phase-1 API from the pinned libsm64.h."""
+    _validate_ctypes_abi_layout()
+    required_exports = (
+        "sm64_global_init",
+        "sm64_global_terminate",
+        "sm64_static_surfaces_load",
+        "sm64_mario_create",
+        "sm64_mario_tick",
+        "sm64_mario_delete",
+        "sm64_set_mario_faceangle",
+    )
+    missing = [name for name in required_exports if not hasattr(library, name)]
+    if missing:
+        raise MarioLifecycleError(
+            "The bundled libsm64 library is missing required export(s) {} for "
+            "pinned upstream commit {}. Reinstall a clean matching package.".format(
+                ", ".join(missing), PINNED_LIBSM64_COMMIT
+            )
+        )
+
     library.sm64_global_init.argtypes = [
-        ct.POINTER(ct.c_ubyte), ct.POINTER(ct.c_ubyte), ct.c_char_p,
+        ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8),
     ]
     library.sm64_global_init.restype = None
     library.sm64_global_terminate.argtypes = []
     library.sm64_global_terminate.restype = None
     library.sm64_static_surfaces_load.argtypes = [ct.POINTER(SM64Surface), ct.c_uint32]
     library.sm64_static_surfaces_load.restype = None
-    library.sm64_mario_create.argtypes = [ct.c_int16, ct.c_int16, ct.c_int16]
+    library.sm64_mario_create.argtypes = [ct.c_float, ct.c_float, ct.c_float]
     library.sm64_mario_create.restype = ct.c_int32
-    library.sm64_mario_delete.argtypes = [ct.c_uint32]
+    library.sm64_mario_delete.argtypes = [ct.c_int32]
     library.sm64_mario_delete.restype = None
     library.sm64_mario_tick.argtypes = [
-        ct.c_uint32,
+        ct.c_int32,
         ct.POINTER(SM64MarioInputs),
         ct.POINTER(SM64MarioState),
         ct.POINTER(SM64MarioGeometryBuffers),
     ]
     library.sm64_mario_tick.restype = None
-    # This setter is present in newer builds, but the bundled 2022 builds are
-    # not assumed to export it on every platform.
-    face_setter = getattr(library, "sm64_set_mario_faceangle", None)
-    if face_setter is not None:
-        face_setter.argtypes = [ct.c_uint32, ct.c_float]
-        face_setter.restype = None
+    library.sm64_set_mario_faceangle.argtypes = [ct.c_int32, ct.c_float]
+    library.sm64_set_mario_faceangle.restype = None
+    _native_stage("after_abi_configuration")
 
 
 def _make_tick_timer(session):
@@ -496,6 +791,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         return "Could not prepare Blender for Mario: {}".format(exc)
 
     try:
+        _validate_ctypes_abi_layout()
         session.library = _load_native_library()
         session.library_loaded = True
         sm64 = session.library
@@ -506,19 +802,25 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         texture_buff = (ct.c_ubyte * (4 * SM64_TEXTURE_WIDTH * SM64_TEXTURE_HEIGHT))()
         session.global_init_attempted = True
         _lifecycle_log(session, "global init started")
-        session.library.sm64_global_init(rom_chars.from_buffer(rom_bytes), texture_buff, None)
+        _native_stage("before_global_init")
+        session.library.sm64_global_init(rom_chars.from_buffer(rom_bytes), texture_buff)
+        _native_stage("after_global_init")
         session.global_initialized = True
         _lifecycle_log(session, "global init succeeded")
         initialize_all_data(texture_buff)
 
         print("Preparing scene collision\u2026")
         (surface_array, surface_array_len) = get_surface_array_from_scene()
+        _native_stage("before_static_surface_load")
         session.library.sm64_static_surfaces_load(surface_array, surface_array_len)
+        _native_stage("after_static_surface_load")
 
         session.mario_create_attempted = True
         _lifecycle_log(session, "Mario create started")
+        _native_stage("before_mario_create")
         print("Starting Live Mario\u2026")
-        mario_id = int(session.library.sm64_mario_create(0, 0, 0))
+        mario_id = int(session.library.sm64_mario_create(0.0, 0.0, 0.0))
+        _native_stage("after_mario_create")
         if mario_id < 0:
             _lifecycle_log(session, "Mario create failed")
             raise MarioLifecycleError("There is no ground under the 3D cursor where Mario can spawn")
@@ -680,14 +982,14 @@ def capture_mario_starting_mark():
         raise RuntimeError("Live Mario is unavailable")
     return {
         "position": (
-            float(mario_state.posX),
-            float(mario_state.posY),
-            float(mario_state.posZ),
+            float(mario_state.position[0]),
+            float(mario_state.position[1]),
+            float(mario_state.position[2]),
         ),
         "velocity": (
-            float(mario_state.velX),
-            float(mario_state.velY),
-            float(mario_state.velZ),
+            float(mario_state.velocity[0]),
+            float(mario_state.velocity[1]),
+            float(mario_state.velocity[2]),
         ),
         "face_angle": float(mario_state.faceAngle),
         "health": int(mario_state.health),
@@ -772,8 +1074,7 @@ def restore_mario_starting_mark(mark):
     session = _lifecycle
     if not is_mario_running():
         raise RuntimeError("Live Mario is unavailable")
-    spawn = tuple(max(-32768, min(32767, int(round(value))))
-                  for value in mark["position"])
+    spawn = tuple(float(value) for value in mark["position"])
     old_id = session.mario_id
     try:
         session.library.sm64_mario_delete(old_id)
@@ -805,10 +1106,24 @@ def restore_mario_starting_mark(mark):
     session.mario_id = replacement_id
     session.mario_created = True
     sm64_mario_id = replacement_id
-    _clear_transient_input_state(session)
-    session.library.sm64_mario_tick(
-        session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
-    )
+    try:
+        session.library.sm64_set_mario_faceangle(
+            session.mario_id, float(mark["face_angle"])
+        )
+        _clear_transient_input_state(session)
+        session.library.sm64_mario_tick(
+            session.mario_id,
+            ct.byref(mario_inputs),
+            ct.byref(mario_state),
+            ct.byref(mario_geo),
+        )
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Mario reset state restoration failed; use End Studio Session and "
+            "restart Blender: {}".format(exc),
+        )
+        raise MarioLifecycleError(session.last_error)
     tick_count = 1
 
     live_object = get_live_mario_object()
@@ -1086,7 +1401,7 @@ def tick_mario(scene, depsgraph=None, _session=None):
         session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
     )
     mario_world_location = native_position_to_blender(
-        mario_state.posX, mario_state.posY, mario_state.posZ
+        mario_state.position[0], mario_state.position[1], mario_state.position[2]
     )
 
     if follow_cam:
@@ -1122,14 +1437,13 @@ def tick_mario(scene, depsgraph=None, _session=None):
     if view3d is not None:
         view3d.tag_redraw()
 
-def clamp_bounds(value):
-    value = int(value)
-    bounds = 0x7FFF
-    if value < -bounds:
-        return -bounds, False
-    if value > bounds:
-        return bounds, False
-    return value, True
+def _checked_int32_coordinate(value):
+    """Preserve truncation-to-int semantics while rejecting non-int32 values."""
+    try:
+        integer = int(value)
+    except (OverflowError, ValueError):
+        return 0, False
+    return integer, -0x80000000 <= integer <= 0x7FFFFFFF
 
 
 def _object_terrain(obj):
@@ -1156,6 +1470,7 @@ def get_surface_array_from_scene():
 
     surface_array = (SM64Surface * triangle_count)()
     surface_count = 0
+    skipped_out_of_range = 0
     for obj in objects:
         mesh = obj.data
         terrain = _object_terrain(obj)
@@ -1167,12 +1482,19 @@ def get_surface_array_from_scene():
             native = []
             vertex_in_range = []
             for vertex in world:
-                x, in_x = clamp_bounds(SM64_SCALE_FACTOR * (vertex.x - origin_offset[0]))
-                y, in_y = clamp_bounds(SM64_SCALE_FACTOR * (vertex.z - origin_offset[2]))
-                z, in_z = clamp_bounds(SM64_SCALE_FACTOR * (-vertex.y + origin_offset[1]))
+                x, in_x = _checked_int32_coordinate(
+                    SM64_SCALE_FACTOR * (vertex.x - origin_offset[0])
+                )
+                y, in_y = _checked_int32_coordinate(
+                    SM64_SCALE_FACTOR * (vertex.z - origin_offset[2])
+                )
+                z, in_z = _checked_int32_coordinate(
+                    SM64_SCALE_FACTOR * (-vertex.y + origin_offset[1])
+                )
                 native.append((x, y, z))
-                vertex_in_range.append(in_x or in_y or in_z)
+                vertex_in_range.append(in_x and in_y and in_z)
             if not all(vertex_in_range):
+                skipped_out_of_range += 1
                 continue
 
             surface_type = COLLISION_TYPES['SURFACE_DEFAULT']
@@ -1182,14 +1504,21 @@ def get_surface_array_from_scene():
                 if collision_type is not None:
                     surface_type = COLLISION_TYPES[collision_type]
             surface = surface_array[surface_count]
-            surface.surftype = surface_type
+            surface.type = surface_type
             surface.force = 0
             surface.terrain = terrain
-            (surface.v0x, surface.v0y, surface.v0z) = native[0]
-            (surface.v1x, surface.v1y, surface.v1z) = native[1]
-            (surface.v2x, surface.v2y, surface.v2z) = native[2]
+            for vertex_index in range(3):
+                for axis_index in range(3):
+                    surface.vertices[vertex_index][axis_index] = native[vertex_index][axis_index]
             surface_count += 1
 
+    if skipped_out_of_range:
+        print(
+            "Skipped {} collision surface(s): at least one native X, Y, or Z "
+            "coordinate was outside the signed 32-bit range.".format(
+                skipped_out_of_range
+            )
+        )
     print("Scene collision ready: {} surfaces".format(surface_count))
     return surface_array, surface_count
 

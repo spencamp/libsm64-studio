@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
+import json
 from pathlib import Path
 import shutil
 import zipfile
@@ -14,6 +16,8 @@ REQUIRED_MARIO_API = {
     "abandon_bake_transition", "begin_mario_recording",
     "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
 }
+PINNED_LIBSM64_COMMIT = "fd11813208272b4271d92bd92feb8f3fdbe61be5"
+NATIVE_FILES = {"libsm64-build.json", "sm64.dll", "libsm64.so"}
 
 
 def _top_level_symbols(path: Path) -> set[str]:
@@ -54,6 +58,55 @@ def validate_package(root: Path) -> None:
     package = root / "libsm64_studio"
     if not package.is_dir():
         raise RuntimeError("Missing libsm64_studio package directory")
+
+    package_lib = package / "lib"
+    manifest_path = package_lib / "libsm64-build.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Invalid native build manifest: {}".format(exc)) from exc
+    expected_manifest = {
+        "repository": "libsm64/libsm64",
+        "commit": PINNED_LIBSM64_COMMIT,
+        "header": "src/libsm64.h",
+        "windows_artifact": "sm64.dll",
+        "linux_artifact": "libsm64.so",
+    }
+    for field_name, expected in expected_manifest.items():
+        if manifest.get(field_name) != expected:
+            raise RuntimeError(
+                "Native manifest {} must be {!r}, got {!r}".format(
+                    field_name, expected, manifest.get(field_name)
+                )
+            )
+    for artifact_name in ("sm64.dll", "libsm64.so"):
+        artifact = package_lib / artifact_name
+        if not artifact.is_file():
+            raise RuntimeError("Missing packaged native artifact: {}".format(artifact_name))
+        expected_hash = manifest.get("artifacts", {}).get(artifact_name, {}).get("sha256")
+        actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if expected_hash != actual_hash:
+            raise RuntimeError(
+                "Native artifact hash mismatch for {}: expected {}, actual {}".format(
+                    artifact_name, expected_hash, actual_hash
+                )
+            )
+        runtime_artifact = root / "lib" / artifact_name
+        if not runtime_artifact.is_file() or runtime_artifact.read_bytes() != artifact.read_bytes():
+            raise RuntimeError("Runtime/package native mismatch: {}".format(artifact_name))
+    runtime_manifest = root / "lib" / "libsm64-build.json"
+    if not runtime_manifest.is_file() or runtime_manifest.read_bytes() != manifest_path.read_bytes():
+        raise RuntimeError("Runtime/package native manifest mismatch")
+    sm64_named_files = {
+        path.name for path in package_lib.iterdir()
+        if path.is_file() and "sm64" in path.name.lower()
+    }
+    if sm64_named_files != NATIVE_FILES:
+        raise RuntimeError(
+            "Unexpected or missing libsm64 native files: {}".format(
+                ", ".join(sorted(sm64_named_files ^ NATIVE_FILES))
+            )
+        )
 
     for packaged_source in sorted(package.glob("*.py")):
         runtime_source = root / packaged_source.name

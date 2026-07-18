@@ -1,0 +1,64 @@
+{
+  "abi_probe": {
+    "SM64MarioGeometryBuffers": {
+      "color": 16,
+      "normal": 8,
+      "numTrianglesUsed": 32,
+      "position": 0,
+      "size": 40,
+      "uv": 24
+    },
+    "SM64MarioInputs": {
+      "buttonA": 16,
+      "buttonB": 17,
+      "buttonZ": 18,
+      "camLookX": 0,
+      "camLookZ": 4,
+      "size": 20,
+      "stickX": 8,
+      "stickY": 12
+    },
+    "SM64MarioState": {
+      "action": 36,
+      "animFrame": 44,
+      "animID": 40,
+      "faceAngle": 24,
+      "flags": 48,
+      "forwardVelocity": 28,
+      "health": 32,
+      "invincTimer": 56,
+      "particleFlags": 52,
+      "position": 0,
+      "size": 60,
+      "velocity": 12
+    },
+    "SM64Surface": {
+      "force": 2,
+      "size": 44,
+      "terrain": 4,
+      "type": 0,
+      "vertices": 8
+    },
+    "pointer_size": 8
+  },
+  "artifacts": {
+    "libsm64.so": {
+      "build_target": "make lib",
+      "sha256": "44a586475df7254f272d20a969e6a25442834f1cc1427c7b40c0ec5592257656",
+      "target": "x86_64-linux-gnu",
+      "toolchain": "Zig 0.16.0 x86_64-linux-gnu"
+    },
+    "sm64.dll": {
+      "build_target": "make lib",
+      "sha256": "6f51ec90ef15d2eead509cfcd863162416f24541cf16e94bbd138526cddf873f",
+      "target": "x86_64-windows-gnu",
+      "toolchain": "MSYS2 MinGW-w64 GCC 16.1.0 x86_64-w64-mingw32"
+    }
+  },
+  "commit": "fd11813208272b4271d92bd92feb8f3fdbe61be5",
+  "header": "src/libsm64.h",
+  "linux_artifact": "libsm64.so",
+  "repository": "libsm64/libsm64",
+  "schema_version": 1,
+  "windows_artifact": "sm64.dll"
+}

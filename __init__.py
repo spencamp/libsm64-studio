@@ -10,7 +10,7 @@ _MARIO_REQUIRED_API = (
     "reset_to_persistent_start_mark", "return_to_start_mark_after_transition",
     "set_persistent_start_mark",
 )
-_RUNTIME_API_VERSION = 4
+_RUNTIME_API_VERSION = 5
 
 
 def _reload_stale_runtime_modules():
@@ -57,7 +57,7 @@ bl_info = {
     "author" : "libsm64",
     "description" : "Record, bake, and edit Mario performances in Blender",
     "blender" : (2, 80, 0),
-    "version" : (2, 4, 0),
+    "version" : (2, 6, 0),
     "location" : "View3D > Sidebar > LibSM64 Studio",
     "warning" : "",
     "category" : "Generic"
@@ -129,7 +129,7 @@ from .take_manager import (
 
 
 _confirmation_message = ""
-BUILD_ID = "2.5.1+static-collision"
+BUILD_ID = "2.6.0+libsm64-fd118132"
 
 
 def _addon_preferences(context):
