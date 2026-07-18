@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.5.0+chunked-collision"
+    assert addon.BUILD_ID == "2.5.1+static-collision"
 
 
 class NativeCall:
@@ -213,6 +213,21 @@ assert "injected init failure" in insert_with(init_failure)
 assert init_failure.counts() == {
     "global_init": 1, "global_terminate": 0, "mario_create": 0, "mario_delete": 0,
 }
+assert_idle()
+
+# Failed whole-scene collision extraction never loads surfaces or creates Mario,
+# but it does release the successfully initialized global generation.
+original_surface_extractor = mario.get_surface_array_from_scene
+mario.get_surface_array_from_scene = lambda: (_ for _ in ()).throw(
+    RuntimeError("injected collision extraction failure")
+)
+collision_failure = FakeLibrary()
+assert "injected collision extraction failure" in insert_with(collision_failure)
+assert len(collision_failure.sm64_static_surfaces_load.calls) == 0
+assert collision_failure.counts() == {
+    "global_init": 1, "global_terminate": 1, "mario_create": 0, "mario_delete": 0,
+}
+mario.get_surface_array_from_scene = original_surface_extractor
 assert_idle()
 
 # Failed Mario creation unwinds the successfully initialized global exactly once.

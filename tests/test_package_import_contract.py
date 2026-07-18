@@ -47,6 +47,10 @@ class PackageImportContractTests(unittest.TestCase):
                 top_level_assignments(base / "mario.py") & LIFECYCLE_SYMBOLS,
                 LIFECYCLE_SYMBOLS,
             )
+            self.assertEqual(
+                mario_imports(base / "__init__.py") & LIFECYCLE_SYMBOLS,
+                LIFECYCLE_SYMBOLS,
+            )
 
     def test_every_explicit_init_import_exists_in_its_owner_module(self):
         for base in (ROOT, PACKAGE):
@@ -66,24 +70,32 @@ class PackageImportContractTests(unittest.TestCase):
                     if alias.name != "*":
                         self.assertIn(alias.name, symbols, "{}.{}".format(node.module, alias.name))
 
-    def test_collision_cache_api_has_one_clear_owner(self):
+    def test_collision_streaming_and_cache_runtime_are_absent(self):
         for base in (ROOT, PACKAGE):
             mario_source = (base / "mario.py").read_text(encoding="utf-8")
-            cache_source = (base / "collision_cache.py").read_text(encoding="utf-8")
-            mario_defs = {
-                node.name for node in ast.parse(mario_source).body
-                if isinstance(node, ast.FunctionDef)
-            }
-            cache_defs = {
-                node.name for node in ast.parse(cache_source).body
-                if isinstance(node, ast.FunctionDef)
-            }
-            self.assertNotIn("clear_collision_cache", mario_defs)
-            self.assertIn("clear_collision_cache", cache_defs)
-            self.assertEqual(
-                mario_imports(base / "__init__.py") & LIFECYCLE_SYMBOLS,
-                LIFECYCLE_SYMBOLS,
-            )
+            init_source = (base / "__init__.py").read_text(encoding="utf-8")
+            self.assertFalse((base / "collision_cache.py").exists())
+            for forbidden in (
+                "collision_cache", "chunk_coordinate", "_handle_collision_boundary",
+                "_replace_collision_and_mario",
+                "Could not recreate Mario after loading nearby collision",
+            ):
+                self.assertNotIn(forbidden, mario_source)
+            self.assertNotIn("clear_collision_cache", init_source)
+            self.assertNotIn("ClearCollisionCache", init_source)
+
+    def test_static_surfaces_load_only_in_session_start(self):
+        for base in (ROOT, PACKAGE):
+            tree = ast.parse((base / "mario.py").read_text(encoding="utf-8"))
+            owners = []
+            for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+                if any(
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "sm64_static_surfaces_load"
+                    for node in ast.walk(function)
+                ):
+                    owners.append(function.name)
+            self.assertEqual(owners, ["_configure_native_api", "insert_mario"])
 
     def test_start_mark_api_is_explicit_and_recording_does_not_capture_it(self):
         mario_tree = ast.parse((PACKAGE / "mario.py").read_text(encoding="utf-8"))

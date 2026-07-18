@@ -19,15 +19,19 @@ from libsm64_studio.recording import recorder
 
 
 class NativeCall:
-    def __init__(self, result=None, failure=None):
+    def __init__(self, result=None, failure=None, name=None, events=None):
         self.result = result
         self.failure = failure
         self.calls = []
         self.argtypes = None
         self.restype = object()
+        self.name = name
+        self.events = events
 
     def __call__(self, *args):
         self.calls.append(args)
+        if self.events is not None:
+            self.events.append(self.name)
         if self.failure is not None:
             raise self.failure
         return self.result
@@ -35,11 +39,12 @@ class NativeCall:
 
 class FakeLibrary:
     def __init__(self, mario_id):
+        self.events = []
         self.sm64_global_init = NativeCall()
         self.sm64_global_terminate = NativeCall()
-        self.sm64_static_surfaces_load = NativeCall()
-        self.sm64_mario_create = NativeCall(mario_id)
-        self.sm64_mario_delete = NativeCall()
+        self.sm64_static_surfaces_load = NativeCall(name="surfaces_load", events=self.events)
+        self.sm64_mario_create = NativeCall(mario_id, name="mario_create", events=self.events)
+        self.sm64_mario_delete = NativeCall(name="mario_delete", events=self.events)
         self.sm64_mario_tick = NativeCall()
 
 
@@ -80,6 +85,9 @@ libraries.append(first)
 assert mario.insert_mario("mock.z64", 100, False) is None
 session = mario._lifecycle
 timer = session.timer_callback
+assert len(first.sm64_static_surfaces_load.calls) == 1
+assert len(first.sm64_mario_create.calls) == 1
+assert first.events.index("surfaces_load") < first.events.index("mario_create")
 assert mario.live_control_status() == mario.LIVE_IDLE
 assert bpy.app.timers.is_registered(timer)
 assert unrelated_handler in bpy.app.handlers.frame_change_pre
@@ -89,6 +97,9 @@ assert scene.render.fps == 24 and math.isclose(scene.render.fps_base, 1.001, rel
 ticks_before = len(first.sm64_mario_tick.calls)
 assert timer() == mario.SIMULATION_INTERVAL
 assert len(first.sm64_mario_tick.calls) == ticks_before + 1
+assert len(first.sm64_static_surfaces_load.calls) == 1
+assert len(first.sm64_mario_create.calls) == 1
+assert len(first.sm64_mario_delete.calls) == 0
 assert not recorder.active and recorder.sample_count == 0
 
 # A persistent mark is deliberate; recording captures only later ticks and does

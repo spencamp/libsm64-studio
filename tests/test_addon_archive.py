@@ -49,6 +49,7 @@ class AddonArchiveTests(unittest.TestCase):
                 mario_source = archive.read("libsm64_studio/mario.py").decode("utf-8")
             self.assertIn('mesh.vertices.foreach_set("co", coordinates)', mario_source)
             self.assertNotIn("bmesh.new()", mario_source)
+            self.assertNotIn("libsm64_studio/collision_cache.py", archive.namelist())
 
 if __name__ == "__main__":
     unittest.main()

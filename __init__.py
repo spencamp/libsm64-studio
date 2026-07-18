@@ -10,7 +10,7 @@ _MARIO_REQUIRED_API = (
     "reset_to_persistent_start_mark", "return_to_start_mark_after_transition",
     "set_persistent_start_mark",
 )
-_RUNTIME_API_VERSION = 3
+_RUNTIME_API_VERSION = 4
 
 
 def _reload_stale_runtime_modules():
@@ -37,7 +37,7 @@ def _reload_stale_runtime_modules():
                 "restart Blender before enabling the updated add-on"
             )
 
-    for suffix in ("recording", "input_reader", "input_reader_win", "collision_cache", "mario"):
+    for suffix in ("recording", "input_reader", "input_reader_win", "mario"):
         module = sys.modules.get("{}.{}".format(__package__, suffix))
         if module is not None:
             importlib.reload(module)
@@ -98,11 +98,6 @@ if RUNTIME_API_VERSION != _RUNTIME_API_VERSION:
         "LibSM64 Studio has a mixed-file installation. Remove the existing "
         "libsm64_studio add-on directory and reinstall the current ZIP."
     )
-from .collision_cache import (
-    clear_collision_cache,
-    collision_diagnostics,
-    collision_status_message,
-)
 from . recording import (
     RecordingError,
     bake_shape_keys,
@@ -134,7 +129,7 @@ from .take_manager import (
 
 
 _confirmation_message = ""
-BUILD_ID = "2.5.0+chunked-collision"
+BUILD_ID = "2.5.1+static-collision"
 
 
 def _addon_preferences(context):
@@ -294,13 +289,6 @@ class Main_PT_Panel(bpy.types.Panel):
         insert_row = col.row()
         insert_row.enabled = preferences is not None
         insert_row.operator(InsertMario_OT_Operator.bl_idname, text='Start Live Mario')
-        collision_status = collision_status_message()
-        if collision_status:
-            col.label(
-                text=collision_status,
-                icon='ERROR' if "boundary reached" in collision_status else 'INFO',
-            )
-        col.operator(ClearCollisionCache_OT_Operator.bl_idname, text="Clear Collision Cache")
         col.prop(settings, "camera_shift")
         col.operator(ControlMario_OT_Operator.bl_idname, text='Control Live Mario with keyboard')
         col.label(text="WASD + JKL to move. ESC to stop.")
@@ -475,30 +463,6 @@ class InsertMario_OT_Operator(bpy.types.Operator):
         if err != None:
             self.report({"ERROR"}, err)
             return {'CANCELLED'}
-        stats = collision_diagnostics()
-        self.report(
-            {'INFO'},
-            "Loaded {} nearby surfaces in {:.2f}s ({} object, {} chunk cache hits)".format(
-                stats.get("native_surface_count", 0),
-                stats.get("duration_seconds", 0.0),
-                stats.get("object_cache_hits", 0),
-                stats.get("chunk_cache_hits", 0),
-            ),
-        )
-        return {'FINISHED'}
-
-
-class ClearCollisionCache_OT_Operator(bpy.types.Operator):
-    bl_idname = "view3d.libsm64_clear_collision_cache"
-    bl_label = "Clear Collision Cache"
-    bl_description = "Discard in-memory object geometry and spatial collision chunks"
-
-    def execute(self, context):
-        object_count, chunk_count = clear_collision_cache()
-        self.report(
-            {'INFO'},
-            "Cleared {} object and {} chunk cache entries".format(object_count, chunk_count),
-        )
         return {'FINISHED'}
 
 
@@ -871,7 +835,6 @@ register_classes, unregister_classes = bpy.utils.register_classes_factory((
     LibSm64Preferences,
     Main_PT_Panel,
     InsertMario_OT_Operator,
-    ClearCollisionCache_OT_Operator,
     ControlMario_OT_Operator,
     SetStartMark_OT_Operator,
     ResetToStartMark_OT_Operator,

@@ -49,9 +49,9 @@ if configured_install:
     ).digest()
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
     assert_init_import_contract(expected_package)
-    cache_module = importlib.import_module("libsm64_studio.collision_cache")
-    assert addon.clear_collision_cache is cache_module.clear_collision_cache
-    assert bpy.ops.view3d.libsm64_clear_collision_cache() == {'FINISHED'}
+    assert not (expected_package / "collision_cache.py").exists()
+    assert not hasattr(addon, "clear_collision_cache")
+    assert not hasattr(bpy.types, "ClearCollisionCache_OT_Operator")
 
     # The bootstrap enabled (registered) the package. Exercise unregistration
     # and registration once more through Blender's real add-on lifecycle.
@@ -60,7 +60,7 @@ if configured_install:
     addon = importlib.import_module("libsm64_studio")
     mario = importlib.import_module("libsm64_studio.mario")
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-    assert mario.RUNTIME_API_VERSION == 3
+    assert mario.RUNTIME_API_VERSION == 4
     assert_init_import_contract(expected_package)
     assert addon.BAKING == mario.BAKING
     assert addon.POISONED == mario.POISONED
@@ -103,7 +103,7 @@ else:
             addon = importlib.reload(addon)
             mario = importlib.import_module("libsm64_studio.mario")
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-            assert mario.RUNTIME_API_VERSION == 3
+            assert mario.RUNTIME_API_VERSION == 4
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
         finally:
