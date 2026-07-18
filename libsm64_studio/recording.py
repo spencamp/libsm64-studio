@@ -236,7 +236,7 @@ def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
     import bpy
 
     if source_object is None or getattr(source_object, "type", None) != 'MESH':
-        raise RecordingError("The live LibSM64 Mario mesh is unavailable")
+        raise RecordingError("The Live Mario mesh is unavailable")
     if not samples:
         raise RecordingError("No Mario samples were captured")
 
@@ -252,11 +252,11 @@ def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
 
     source_mesh = source_object.data
     baked_mesh = source_mesh.copy()
-    baked_mesh.name = "LibSM64 Mario Bake Mesh"
+    baked_mesh.name = "LibSM64 Studio Performance Take Mesh"
     _set_coordinates(baked_mesh.vertices, samples[0])
     baked_mesh.update()
 
-    baked_object = bpy.data.objects.new("LibSM64 Mario Bake", baked_mesh)
+    baked_object = bpy.data.objects.new("LibSM64 Studio Performance Take", baked_mesh)
     action = None
     try:
         collections = list(source_object.users_collection)
@@ -304,7 +304,7 @@ def bake_shape_keys(context, source_object, samples, start_frame, target_fps):
             for point in fcurve.keyframe_points:
                 point.interpolation = 'CONSTANT'
 
-        baked_object["libsm64_source_addon"] = "libsm64-blender"
+        baked_object["libsm64_source_addon"] = "LibSM64 Studio"
         baked_object["libsm64_is_bake"] = True
         baked_object["libsm64_sample_count"] = len(samples)
         baked_object["libsm64_sample_fps"] = SAMPLE_FPS

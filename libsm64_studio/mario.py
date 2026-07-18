@@ -350,7 +350,9 @@ def _poison_session(session, message):
 
 
 def _create_live_object():
-    mario_obj = bpy.data.objects.new('LibSM64 Mario', bpy.data.meshes['libsm64_mario_mesh'])
+    mario_obj = bpy.data.objects.new(
+        'LibSM64 Studio Live Mario', bpy.data.meshes['libsm64_mario_mesh']
+    )
     mario_obj[LIVE_ROLE] = LIVE_ROLE_VALUE
     bpy.context.scene.collection.objects.link(mario_obj)
     return mario_obj
@@ -690,7 +692,7 @@ def restore_mario_starting_mark(mark):
         session.mario_delete_attempted = True
         _poison_session(
             session,
-            "Mario reset cleanup failed; use End Mario Control and restart Blender: {}".format(exc),
+            "Mario reset cleanup failed; use End Studio Session and restart Blender: {}".format(exc),
         )
         raise MarioLifecycleError(session.last_error)
     session.mario_created = False
@@ -708,7 +710,7 @@ def restore_mario_starting_mark(mark):
     if replacement_id < 0:
         _poison_session(
             session,
-            "Could not restore Live Mario at the starting mark; use End Mario Control",
+            "Could not restore Live Mario at the starting mark; use End Studio Session",
         )
         raise MarioLifecycleError(session.last_error)
     session.mario_id = replacement_id

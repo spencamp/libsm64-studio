@@ -1,46 +1,72 @@
-# libsm64-blender - Blender client for LibSM64
+# LibSM64 Studio
 
-This add-on integrates [libsm64](https://github.com/libsm64/libsm64) into Blender and provides various additional integrations with [Fast64](https://bitbucket.org/kurethedead/fast64/).
-Practically, this means if you're making levels with Fast64 in Blender, you can use this add-on to drop a controller-playable Mario into your scene to run around and test your terrain layout.
+**Record Mario performances in Blender.**
+
+LibSM64 Studio integrates [libsm64](https://github.com/libsm64/libsm64) with
+Blender so you can direct a controllable Live Mario, rehearse a shot, record a
+performance, and bake it into a portable Blender animation. The result is a
+self-contained take that can be edited, reviewed, rendered, and reopened
+without the ROM, controller, or live simulation.
+
+Fast64 terrain and collision metadata remain supported for scene compatibility,
+but they are not required and are no longer the focus of the product. LibSM64
+Studio is a performance-capture workflow for Mario in Blender.
 
 **Warning:** This plugin hasn't been battle-tested for very long, save often and use at your own risk!
 
 If you find a way to crash it, please post an issue or otherwise let me know!
 
-![Example map](https://github.com/libsm64/libsm64-blender/raw/master/docs/example.gif)
-###### Example map by [Agent-11](https://github.com/agent-11)
+![LibSM64 Studio performance workflow](docs/performance-workflow.svg)
 
-### Installation
+See [the media capture guide](docs/media-capture.md) for the release-quality
+screenshots and demonstration footage that accompany this workflow.
 
-Only Windows and linux are currently supported, no MacOS support yet unfortunately.
+## Installation
 
-Download the latest release zip [from here](https://github.com/libsm64/libsm64-blender/releases). In Blender, go to Edit -> Preferences -> Add-Ons and click the "Install" button to install the plugin from the zip file. Find the libsm64-blender addon in the addon list and enable it. If it does not show up, go to Edit -> Preferences -> Save&Load and make sure 'Auto Run Python Scripts' is enabled.
+Windows and Linux are currently supported; macOS is not yet supported.
 
-### Usage
-Before opening Blender make sure you have an XInput controller connected if you want to control Mario with a controller. Alternatively you can use the keyboard to control him. With the add-on enabled there should be a LibSM64 tab in the properties sidebar. Browse to an unmodified SM64 US z64 ROM, and then click the "Insert Mario" button to insert a controllable Mario at the 3D cursor location. Use **End Mario Control** when finished; this also performs deferred rejected-take cleanup.
+Download the latest [LibSM64 Studio release ZIP](https://github.com/spencamp/libsm64-studio/releases).
+In Blender, open **Edit → Preferences**, choose **Add-ons** (or **Get
+Extensions → ▾ → Install from Disk** in newer Blender releases), select the ZIP,
+then search for **LibSM64 Studio** and enable it. If it does not appear, enable
+**Auto Run Python Scripts** in Preferences.
+
+## Start a studio session
+
+Before opening Blender, connect an XInput controller to perform with one;
+keyboard control is also available. In the 3D Viewport sidebar (`N`), open the
+**LibSM64 Studio** tab, browse to an unmodified SM64 US z64 ROM, and click
+**Start Live Mario** to place a controllable Mario at the 3D cursor. Use
+**End Studio Session** when finished; it also performs deferred rejected-take
+cleanup.
 
 *Note:* The SM64 US ROM must be the one with the SHA1 checksum of `9bef1128717f958171a4afac3ed78ee2bb4e86ce`.
 
-### Recording performance takes
+## Capture a Mario performance
 
-The **Performance Recording** section is built around one controllable Live Mario
-and any number of baked takes:
+The **Record a Mario Performance** panel is built around one controllable Live
+Mario and any number of baked takes:
 
-1. Set the scene FPS and insert Mario. Live Mario immediately enters rehearsal
+1. Set the scene FPS and start Live Mario. Live Mario immediately enters rehearsal
    mode and remains controllable between takes.
 2. Maneuver Mario to the desired position and click **Set Start Mark**. Use
    **Reset to Mark** whenever you want to return there with transient native
    movement state cleared.
-3. Move the timeline to the desired output start frame and click **Start
-   Recording**. Recording does not move Mario or replace the Start Mark by
-   default, so you may intentionally begin a take from somewhere else.
-4. Optionally enable **Reset to Mark when recording starts** to reset and resume
+3. Move the timeline to the desired output start frame and click **Set Start
+   Frame**. Enable **Start recording from saved frame** to return to this frame
+   automatically before each new capture. **Go to Start Frame** recalls it
+   manually. The Timeline Start Frame is stored in the `.blend` and remains
+   independent of Mario's spatial Start Mark.
+4. Click **Start Recording**. Recording does not move Mario or replace the Mario
+   Start Mark by default, so you may intentionally begin a take from somewhere
+   else.
+5. Optionally enable **Reset to Mark when recording starts** to reset and resume
    simulation at the mark before capture begins. This option is unavailable
    until the active Live Mario session has a valid mark.
-5. Perform the take, then click **Stop & Bake**. Live Mario returns to the
+6. Perform the take, then click **Stop & Bake**. Live Mario returns to the
    persistent Start Mark when one exists and pauses for review; without a mark,
    baking still succeeds and Live Mario pauses in place.
-6. Scrub or play the result with Blender's normal timeline controls, favorite or
+7. Scrub or play the result with Blender's normal timeline controls, favorite or
    reject it, click **Reset to Mark** to rehearse, or click **Start Recording**
    for another take without reinserting Mario.
 
@@ -59,7 +85,7 @@ is current. Unfavoriting never rejects a take.
 
 Rejecting a regular take hides it and moves it into the collapsed **Rejected**
 section. It can be restored until live control ends. Favorites must be unfavorited
-before rejection. **End Mario Control** permanently removes rejected take objects
+before rejection. **End Studio Session** permanently removes rejected take objects
 and their exclusively owned animation data while preserving regular takes,
 favorites, shared materials, and the packed Mario texture.
 
@@ -85,7 +111,7 @@ deformed geometry.
 
 Use **Cancel Recording** to discard a pending take and return Live Mario to the
 persistent Start Mark when one exists, without creating a take. Stop, cancel,
-and repeated recordings never replace the mark. **End Mario Control** clears it,
+and repeated recordings never replace the mark. **End Studio Session** clears it,
 and a mark from an older native lifecycle generation is never reused.
 Live Mario pauses for review; **Reset to Mark** leaves it controllable, and the
 next **Start Recording** resumes simulation before capture.
@@ -93,7 +119,7 @@ Live Mario remains visible during control; baked-take visibility continues to
 follow the current/favorite/regular/rejected rules independently. If the two
 overlap after a reset, move Live Mario to continue rehearsing or hide it manually.
 
-### Manual recording smoke test
+## Validation
 
 ### Automated Blender CLI tests
 
@@ -129,7 +155,8 @@ Run the following for each target FPS you need to validate (especially 24, 30,
 and 60):
 
 1. Open Blender with the add-on enabled and set the scene FPS to 24.
-2. Add collision ground, place the 3D cursor over it, and insert Mario.
+2. Add collision-ready scene geometry, place the 3D cursor over it, and start
+   Live Mario.
 3. Confirm Mario moves before recording. Rehearse for at least ten seconds and
    verify no samples or take are created.
 4. Stop at a chosen position and click **Set Start Mark**. Move somewhere else,
@@ -157,21 +184,21 @@ and 60):
 14. Install a temporary unrelated `frame_change_pre` handler, run and stop another
    simulation, and verify that handler remains installed.
 15. Favorite a take and record another; confirm both remain visible. Reject two
-   regular takes, end Mario control, and confirm only rejected take-owned data is
+   regular takes, end the Studio Session, and confirm only rejected take-owned data is
    deleted.
-16. End Mario control, insert Mario again, and confirm the old Start Mark is
+16. End the Studio Session, start Live Mario again, and confirm the old Start Mark is
    unavailable. Save and reopen a file containing regular, favorite, and rejected takes;
    verify categories, current visibility, and the next take number are restored.
 17. Repeat the rehearsal, record, bake, cancel, review, and shutdown checks at
     30 and 60 FPS. Confirm native Mario delete/global terminate occur once at
-    **End Mario Control** and no owned timer remains.
+    **End Studio Session** and no owned timer remains.
 
-### Texture persistence acceptance test
+### Baked-performance asset persistence test
 
-1. Insert Mario and confirm the normal red, blue, and skin colors are visible.
+1. Start Live Mario and confirm the normal red, blue, and skin colors are visible.
 2. Record and bake at least two takes.
 3. Save the `.blend` and close Blender completely.
-4. Reopen the saved file without clicking **Insert Mario**.
+4. Reopen the saved file without clicking **Start Live Mario**.
 5. Switch the viewport to Material Preview and confirm every baked Mario is fully
    textured rather than black.
 6. Press Play and confirm both the animation and texture continue to work.
@@ -179,20 +206,29 @@ and 60):
    confirm the baked Marios remain textured and animated without the ROM or
    libsm64 being loaded.
 
-The generated `libsm64_mario_texture` image is shared by all live and baked Mario
-objects and is packed into the `.blend`. Inserting Mario again refreshes that
+The generated `libsm64_mario_texture` image is shared by all Live Mario and baked
+take objects and is packed into the `.blend`. Starting Live Mario again refreshes that
 single packed image from the ROM; it does not create a texture per take.
 
-### Current Features
-- Insert playable Mario into Blender scene
-- Fast64 terrain type and collision surface type support
-- Bake short Mario performances to self-contained shape-key animation
+## Current capabilities
 
-### Near-term Features
-- Water boxes support
-- Toggles to give wing/metal/vanish cap
+- Direct a playable Live Mario in any collision-ready Blender scene.
+- Rehearse, mark a spatial start and timeline start, record, and bake short
+  performances into self-contained shape-key takes.
+- Review, favorite, reject, restore, and retain multiple takes in the `.blend`.
+- Render and reopen baked performances without libsm64, a ROM, or a controller.
+- Use Fast64 terrain and collision metadata when it is present in a scene.
 
-### Far-term Features
-- Moving platform support
-- Camera integration
-- Linking against custom decomp builds (modified controls/Mario model/etc)
+## Planned capabilities
+
+### Near term
+
+- Water and liquid interaction for more varied performances.
+- Wing, Metal, and Vanish Cap controls for performance direction.
+- Additional take-review and camera-framing tools.
+
+### Longer term
+
+- Moving platforms and dynamic scene interaction.
+- Deeper camera integration for recording and shot setup.
+- Custom decomp-runtime support, including modified controls and Mario models.

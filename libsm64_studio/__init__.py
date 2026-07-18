@@ -45,12 +45,12 @@ _reload_stale_runtime_modules()
 
 
 bl_info = {
-    "name" : "libsm64-blender",
+    "name" : "LibSM64 Studio",
     "author" : "libsm64",
-    "description" : "Add a playble Mario to your Blender Scene",
+    "description" : "Record, bake, and edit Mario performances in Blender",
     "blender" : (2, 80, 0),
-    "version" : (2, 3, 0),
-    "location" : "View3D",
+    "version" : (2, 4, 0),
+    "location" : "View3D > Sidebar > LibSM64 Studio",
     "warning" : "",
     "category" : "Generic"
 }
@@ -115,7 +115,7 @@ from .take_manager import (
 
 
 _confirmation_message = ""
-BUILD_ID = "2.3.0+live-control"
+BUILD_ID = "2.4.0+timeline-start"
 
 
 def _addon_preferences(context):
@@ -142,7 +142,7 @@ def _migrate_all_scenes_once():
     for scene in bpy.data.scenes:
         if int(scene.get(SCENE_SCHEMA_VERSION, 0)) < TAKE_SCHEMA_VERSION:
             reconcile_scene(scene)
-    print("libsm64 Studio build {} loaded".format(BUILD_ID))
+    print("LibSM64 Studio build {} loaded".format(BUILD_ID))
     return None
 
 
@@ -187,7 +187,8 @@ def _show_confirmation(message):
 
 class LibSm64Properties(bpy.types.PropertyGroup):
     camera_follow : bpy.props.BoolProperty (
-        name="Follow Mario with 3D cursor + camera",
+        name="Follow Live Mario with cursor + camera",
+        description="Keep the 3D cursor and active camera following Live Mario",
         default=True
     )
     camera_shift : bpy.props.FloatVectorProperty (
@@ -203,7 +204,7 @@ class LibSm64Properties(bpy.types.PropertyGroup):
         size=3
     )
     mario_scale : bpy.props.FloatProperty(
-        name="Blender to SM64 Scale",
+        name="Blender-to-SM64 Scale",
         default=100
     )
     rejected_expanded : bpy.props.BoolProperty(
@@ -215,11 +216,29 @@ class LibSm64Properties(bpy.types.PropertyGroup):
         description="Reset Live Mario to the persistent Start Mark before recording",
         default=False,
     )
+    timeline_start_frame : bpy.props.IntProperty(
+        name="Timeline Start Frame",
+        description="Saved Blender timeline frame used to align recorded takes",
+        default=1,
+        min=-1048574,
+        max=1048574,
+    )
+    timeline_start_frame_set : bpy.props.BoolProperty(
+        name="Timeline Start Frame Set",
+        description="Whether this scene has a saved timeline start frame",
+        default=False,
+        options={'HIDDEN'},
+    )
+    start_recording_from_saved_frame : bpy.props.BoolProperty(
+        name="Start recording from saved frame",
+        description="Move to the saved Timeline Start Frame before capture begins",
+        default=False,
+    )
 
 class LibSm64Preferences(bpy.types.AddonPreferences):
     bl_idname = __name__
     rom_path : bpy.props.StringProperty(
-        name="Path",
+        name="SM64 US ROM",
         description="Path to an unmodified US SM64 ROM",
         subtype='FILE_PATH',
         default=('c:\\sm64.us.z64' if platform.system() == 'Windows' else '~/sm64.us.z64')
@@ -232,8 +251,8 @@ class LibSm64Preferences(bpy.types.AddonPreferences):
 
 class Main_PT_Panel(bpy.types.Panel):
     bl_idname = "LIBSM64_PT_main_panel"
-    bl_label = "Insert Mario"
-    bl_category = "LibSM64"
+    bl_label = "Mario Performance Studio"
+    bl_category = "LibSM64 Studio"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
 
@@ -243,11 +262,11 @@ class Main_PT_Panel(bpy.types.Panel):
         settings = getattr(scene, "libsm64", None) if scene is not None else None
         preferences = _addon_preferences(context)
         if scene is None or settings is None:
-            layout.label(text="LibSM64 is still initializing", icon='INFO')
+            layout.label(text="LibSM64 Studio is still initializing", icon='INFO')
             return
 
         col = layout.column()
-        prop_split(col, settings, "mario_scale", "Blender to SM64 Scale")
+        prop_split(col, settings, "mario_scale", "Blender-to-SM64 Scale")
         if preferences is not None:
             col.prop(preferences, "rom_path")
         else:
@@ -255,14 +274,14 @@ class Main_PT_Panel(bpy.types.Panel):
         col.prop(settings, "camera_follow")
         insert_row = col.row()
         insert_row.enabled = preferences is not None
-        insert_row.operator(InsertMario_OT_Operator.bl_idname, text='Insert Mario')
+        insert_row.operator(InsertMario_OT_Operator.bl_idname, text='Start Live Mario')
         col.prop(settings, "camera_shift")
-        col.operator(ControlMario_OT_Operator.bl_idname, text='Control Mario with keyboard')
+        col.operator(ControlMario_OT_Operator.bl_idname, text='Control Live Mario with keyboard')
         col.label(text="WASD + JKL to move. ESC to stop.")
 
         layout.separator()
         box = layout.box()
-        box.label(text="Performance Recording")
+        box.label(text="Record a Mario Performance")
         box.label(text="Build {}".format(BUILD_ID))
         control_status = live_control_status()
         if control_status == RECORDING:
@@ -286,12 +305,38 @@ class Main_PT_Panel(bpy.types.Panel):
         reset_mark.operator(ResetToStartMark_OT_Operator.bl_idname, text="Reset to Mark", icon='LOOP_BACK')
         mark_is_valid = has_valid_start_mark()
         box.label(
-            text="Start Mark: {}".format("Set" if mark_is_valid else "Not set"),
+            text="Mario Start Mark: {}".format("Set" if mark_is_valid else "Not Set"),
             icon='CHECKMARK' if mark_is_valid else 'INFO',
         )
         auto_reset = box.row()
         auto_reset.enabled = mark_is_valid and control_status == LIVE_IDLE
         auto_reset.prop(settings, "reset_to_mark_on_recording_start")
+
+        timeline_row = box.row(align=True)
+        timeline_row.enabled = not recorder.active
+        timeline_row.operator(
+            SetTimelineStartFrame_OT_Operator.bl_idname,
+            text="Set Start Frame",
+            icon='KEYFRAME_HLT',
+        )
+        go_to_frame = timeline_row.row(align=True)
+        go_to_frame.enabled = settings.timeline_start_frame_set
+        go_to_frame.operator(
+            GoToTimelineStartFrame_OT_Operator.bl_idname,
+            text="Go to Start Frame",
+            icon='PLAY_REVERSE',
+        )
+        timeline_label = (
+            "Frame {}".format(settings.timeline_start_frame)
+            if settings.timeline_start_frame_set else "Not Set"
+        )
+        box.label(
+            text="Timeline Start Frame: {}".format(timeline_label),
+            icon='CHECKMARK' if settings.timeline_start_frame_set else 'INFO',
+        )
+        auto_timeline = box.row()
+        auto_timeline.enabled = settings.timeline_start_frame_set and not recorder.active
+        auto_timeline.prop(settings, "start_recording_from_saved_frame")
 
         primary = box.row()
         primary.scale_y = 1.6
@@ -314,15 +359,15 @@ class Main_PT_Panel(bpy.types.Panel):
             box.label(text=_confirmation_message, icon='CHECKMARK')
         end_row = box.row()
         end_row.enabled = has_owned_native_session()
-        end_row.operator(EndMarioControl_OT_Operator.bl_idname, text="End Mario Control")
+        end_row.operator(EndMarioControl_OT_Operator.bl_idname, text="End Studio Session")
 
         takes = iter_takes()
         current = current_take(scene)
 
         layout.separator()
-        layout.label(text="Current")
+        layout.label(text="Active Take")
         if current is None:
-            layout.label(text="No current take")
+            layout.label(text="No active take")
         else:
             draw_take_row(layout, current, is_current=True)
 
@@ -331,7 +376,7 @@ class Main_PT_Panel(bpy.types.Panel):
             key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
         )
         layout.separator()
-        layout.label(text="Favorites")
+        layout.label(text="Favorite Takes")
         if favorites:
             for obj in favorites:
                 draw_take_row(layout, obj, is_current=(obj is current))
@@ -344,7 +389,7 @@ class Main_PT_Panel(bpy.types.Panel):
             key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
         )
         layout.separator()
-        layout.label(text="Takes")
+        layout.label(text="Other Takes")
         if regular:
             for obj in regular:
                 draw_take_row(layout, obj)
@@ -360,7 +405,7 @@ class Main_PT_Panel(bpy.types.Panel):
         icon = 'TRIA_DOWN' if settings.rejected_expanded else 'TRIA_RIGHT'
         row.prop(
             settings, "rejected_expanded",
-            text="Rejected ({})".format(len(rejected)), icon=icon, emboss=False,
+            text="Rejected Takes ({})".format(len(rejected)), icon=icon, emboss=False,
         )
         if settings.rejected_expanded:
             for obj in rejected:
@@ -391,14 +436,14 @@ def draw_take_row(layout, obj, is_current=False):
 
 class InsertMario_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_insert_mario"
-    bl_label = "Insert Mario"
-    bl_description = "Insert Mario and begin continuous live control for rehearsal and recording"
+    bl_label = "Start Live Mario"
+    bl_description = "Place Live Mario in the scene and begin a performance-capture session"
 
     def execute(self, context):
         scene = context.scene
         preferences = _addon_preferences(context)
         if preferences is None:
-            self.report({"ERROR"}, "LibSM64 add-on preferences are unavailable")
+            self.report({"ERROR"}, "LibSM64 Studio preferences are unavailable")
             return {'CANCELLED'}
         err = insert_mario(preferences.rom_path, scene.libsm64.mario_scale, scene.libsm64.camera_follow)
         if err != None:
@@ -408,14 +453,14 @@ class InsertMario_OT_Operator(bpy.types.Operator):
 
 class ControlMario_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_control_mario"
-    bl_label = "Control with keyboard"
+    bl_label = "Control Live Mario with Keyboard"
     bl_description = "Control Live Mario with the keyboard during rehearsal or recording"
 
     def invoke(self, context, event):
         global config
         config["keyboard_control"] = True
         if not is_mario_running():
-            self.report({"ERROR"}, 'Insert Mario first.')
+            self.report({"ERROR"}, 'Start Live Mario first.')
             return {'CANCELLED'}
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
@@ -449,6 +494,12 @@ class StartRecording_OT_Operator(bpy.types.Operator):
             and has_valid_start_mark()
         )
         try:
+            if (
+                settings is not None
+                and settings.start_recording_from_saved_frame
+                and settings.timeline_start_frame_set
+            ):
+                context.scene.frame_set(int(settings.timeline_start_frame))
             begin_mario_recording(context.scene, reset_to_mark=auto_reset)
         except Exception as exc:
             abandon_bake_transition()
@@ -458,7 +509,55 @@ class StartRecording_OT_Operator(bpy.types.Operator):
             )
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
-        self.report({'INFO'}, "Recording Mario geometry")
+        self.report({'INFO'}, "Recording Mario performance")
+        return {'FINISHED'}
+
+
+class SetTimelineStartFrame_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_set_timeline_start_frame"
+    bl_label = "Set Start Frame"
+    bl_description = "Save the current Blender timeline frame for repeatable takes"
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            getattr(getattr(context, "scene", None), "libsm64", None) is not None
+            and not recorder.active
+        )
+
+    def execute(self, context):
+        settings = context.scene.libsm64
+        settings.timeline_start_frame = int(context.scene.frame_current)
+        settings.timeline_start_frame_set = True
+        _show_confirmation("Timeline Start Frame set")
+        self.report(
+            {'INFO'},
+            "Timeline Start Frame set to {}".format(settings.timeline_start_frame),
+        )
+        return {'FINISHED'}
+
+
+class GoToTimelineStartFrame_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_go_to_timeline_start_frame"
+    bl_label = "Go to Start Frame"
+    bl_description = "Move the Blender timeline to the saved start frame"
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(getattr(context, "scene", None), "libsm64", None)
+        return bool(
+            settings is not None
+            and settings.timeline_start_frame_set
+            and not recorder.active
+        )
+
+    def execute(self, context):
+        settings = context.scene.libsm64
+        context.scene.frame_set(int(settings.timeline_start_frame))
+        self.report(
+            {'INFO'},
+            "Timeline moved to frame {}".format(settings.timeline_start_frame),
+        )
         return {'FINISHED'}
 
 
@@ -565,7 +664,7 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
         _show_confirmation("âœ“ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
-            "Baked {} Mario samples to {}".format(sample_count, label),
+            "Baked {} performance samples to {}".format(sample_count, label),
         )
         return {'FINISHED'}
 
@@ -667,11 +766,11 @@ class RestoreTake_OT_Operator(bpy.types.Operator):
 
 class EndMarioControl_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_end_mario_control"
-    bl_label = "End Mario Control"
-    bl_description = "End live control and permanently remove all rejected takes"
+    bl_label = "End Studio Session"
+    bl_description = "End Live Mario control and permanently remove all rejected takes"
 
     def execute(self, context):
-        recorder.cancel("Mario control ended")
+        recorder.cancel("Studio session ended")
         clear_persistent_start_mark()
         stop_tick_mario()
         config["keyboard_control"] = False
@@ -680,7 +779,7 @@ class EndMarioControl_OT_Operator(bpy.types.Operator):
         live_object = get_live_mario_object()
         if live_object is not None:
             bpy.data.objects.remove(live_object, do_unlink=True)
-        self.report({'INFO'}, "Mario control ended; rejected takes cleaned up")
+        self.report({'INFO'}, "Studio session ended; rejected takes cleaned up")
         return {'FINISHED'}
 
 config = {
@@ -724,6 +823,8 @@ register_classes, unregister_classes = bpy.utils.register_classes_factory((
     ControlMario_OT_Operator,
     SetStartMark_OT_Operator,
     ResetToStartMark_OT_Operator,
+    SetTimelineStartFrame_OT_Operator,
+    GoToTimelineStartFrame_OT_Operator,
     StartRecording_OT_Operator,
     StopAndBake_OT_Operator,
     CancelRecording_OT_Operator,

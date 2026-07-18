@@ -170,6 +170,7 @@ try {
     if (-not $SmokeOnly) {
         Invoke-BlenderTest "live control regression" (Join-Path $repoRoot "tests\blender_live_control_test.py")
         Invoke-BlenderTest "Start Mark regression" (Join-Path $repoRoot "tests\blender_start_mark_test.py")
+        Invoke-BlenderTest "Timeline Start Frame regression" (Join-Path $repoRoot "tests\blender_timeline_start_frame_test.py")
         Invoke-BlenderTest "native lifecycle regression" (Join-Path $repoRoot "tests\blender_native_lifecycle_test.py")
         Invoke-BlenderTest "three-take regression" (Join-Path $repoRoot "tests\blender_three_take_regression_test.py")
     }

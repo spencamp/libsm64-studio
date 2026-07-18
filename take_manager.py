@@ -172,10 +172,10 @@ def register_baked_take(scene, obj):
         obj[TAKE_ID] = take_id
         obj[TAKE_NUMBER] = number
         obj[TAKE_DISPOSITION] = REGULAR
-        obj.name = "LibSM64 Take {:03d}".format(number)
-        mesh.name = "LibSM64 Take {:03d} Mesh".format(number)
-        key_data.name = "LibSM64 Take {:03d} Shape Keys".format(number)
-        action.name = "LibSM64 Take {:03d} Action".format(number)
+        obj.name = "LibSM64 Studio Take {:03d}".format(number)
+        mesh.name = "LibSM64 Studio Take {:03d} Mesh".format(number)
+        key_data.name = "LibSM64 Studio Take {:03d} Shape Keys".format(number)
+        action.name = "LibSM64 Studio Take {:03d} Action".format(number)
         for datablock in (mesh, key_data, action):
             _mark_owned(datablock, take_id)
 

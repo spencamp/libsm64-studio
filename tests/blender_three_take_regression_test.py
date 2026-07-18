@@ -25,7 +25,7 @@ from libsm64_studio import take_manager as takes
 if installed_test:
     expected_root = Path(os.environ["LIBSM64_EXPECTED_INSTALL_ROOT"]).resolve()
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.3.0+live-control"
+    assert addon.BUILD_ID == "2.4.0+timeline-start"
 
 
 def sample(offset_x=0.0, offset_z=0.0):
