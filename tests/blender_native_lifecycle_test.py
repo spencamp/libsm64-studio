@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.6.0+libsm64-fd118132"
+    assert addon.BUILD_ID == "2.7.0+surface-streaming-fd118132"
 
 
 class NativeCall:
@@ -49,6 +49,9 @@ class FakeLibrary:
         self.sm64_mario_delete = NativeCall("mario_delete", failure=delete_failure)
         self.sm64_mario_tick = NativeCall("mario_tick")
         self.sm64_set_mario_faceangle = NativeCall("set_faceangle")
+        self.sm64_surface_object_create = NativeCall("surface_create", result=100)
+        self.sm64_surface_object_move = NativeCall("surface_move")
+        self.sm64_surface_object_delete = NativeCall("surface_delete")
 
     def counts(self):
         return {
@@ -74,7 +77,8 @@ def install_harness(module):
     module._read_validated_rom = lambda _path: bytearray(b"mock-rom")
     module._load_native_library = lambda: libraries.pop(0)
     module.initialize_all_data = ensure_minimal_blender_data
-    module.get_surface_array_from_scene = lambda: ((module.SM64Surface * 0)(), 0)
+    module._initialize_streamed_collision = lambda _session, _position: None
+    module._stream_collision_for_position = lambda _session, _position: False
     module.start_input_reader = lambda: input_counts.__setitem__(
         "start", input_counts["start"] + 1
     )
@@ -188,11 +192,11 @@ assert abi_unused.counts() == {
 mario.SM64MarioState = original_state_type
 assert_idle()
 
-# Every Phase-1 export, including the face setter, is required before init.
+# Every Phase-2 export, including surface objects, is required before init.
 missing_export = FakeLibrary()
-del missing_export.sm64_set_mario_faceangle
+del missing_export.sm64_surface_object_move
 missing_error = insert_with(missing_export)
-assert "sm64_set_mario_faceangle" in missing_error
+assert "sm64_surface_object_move" in missing_error
 assert missing_export.counts() == {
     "global_init": 0, "global_terminate": 0, "mario_create": 0, "mario_delete": 0,
 }
@@ -246,6 +250,14 @@ assert first.sm64_mario_tick.argtypes[0] is mario.ct.c_int32
 assert first.sm64_mario_tick.restype is None
 assert first.sm64_set_mario_faceangle.argtypes == [mario.ct.c_int32, mario.ct.c_float]
 assert first.sm64_set_mario_faceangle.restype is None
+assert first.sm64_surface_object_create.argtypes == [mario.ct.POINTER(mario.SM64SurfaceObject)]
+assert first.sm64_surface_object_create.restype is mario.ct.c_uint32
+assert first.sm64_surface_object_move.argtypes == [
+    mario.ct.c_uint32, mario.ct.POINTER(mario.SM64ObjectTransform),
+]
+assert first.sm64_surface_object_move.restype is None
+assert first.sm64_surface_object_delete.argtypes == [mario.ct.c_uint32]
+assert first.sm64_surface_object_delete.restype is None
 assert len(first.sm64_global_init.calls[0]) == 2
 assert first.sm64_mario_create.calls[0] == (0.0, 0.0, 0.0)
 assert all(isinstance(value, float) for value in first.sm64_mario_create.calls[0])
@@ -303,19 +315,20 @@ assert init_failure.counts() == {
 }
 assert_idle()
 
-# Failed whole-scene collision extraction never loads surfaces or creates Mario,
-# but it does release the successfully initialized global generation.
-original_surface_extractor = mario.get_surface_array_from_scene
-mario.get_surface_array_from_scene = lambda: (_ for _ in ()).throw(
+# Failed initial streamed preparation never creates Mario, but it does release
+# the successfully initialized global generation after the empty static load.
+original_collision_initializer = mario._initialize_streamed_collision
+mario._initialize_streamed_collision = lambda _session, _position: (_ for _ in ()).throw(
     RuntimeError("injected collision extraction failure")
 )
 collision_failure = FakeLibrary()
 assert "injected collision extraction failure" in insert_with(collision_failure)
-assert len(collision_failure.sm64_static_surfaces_load.calls) == 0
+assert len(collision_failure.sm64_static_surfaces_load.calls) == 1
+assert collision_failure.sm64_static_surfaces_load.calls[0][1] == 0
 assert collision_failure.counts() == {
     "global_init": 1, "global_terminate": 1, "mario_create": 0, "mario_delete": 0,
 }
-mario.get_surface_array_from_scene = original_surface_extractor
+mario._initialize_streamed_collision = original_collision_initializer
 assert_idle()
 
 # Failed Mario creation unwinds the successfully initialized global exactly once.

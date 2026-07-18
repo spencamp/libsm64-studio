@@ -18,6 +18,17 @@
       "stickX": 8,
       "stickY": 12
     },
+    "SM64ObjectTransform": {
+      "eulerRotation": 12,
+      "position": 0,
+      "size": 24
+    },
+    "SM64SurfaceObject": {
+      "size": 40,
+      "surfaceCount": 24,
+      "surfaces": 32,
+      "transform": 0
+    },
     "SM64MarioState": {
       "action": 36,
       "animFrame": 44,

@@ -42,6 +42,9 @@ class FakeLibrary:
         self.sm64_mario_delete = NativeCall()
         self.sm64_mario_tick = NativeCall()
         self.sm64_set_mario_faceangle = NativeCall()
+        self.sm64_surface_object_create = NativeCall(100)
+        self.sm64_surface_object_move = NativeCall()
+        self.sm64_surface_object_delete = NativeCall()
 
 
 class Reporter:
@@ -70,7 +73,8 @@ def insert_with(library):
 mario._read_validated_rom = lambda _path: bytearray(b"mock-rom")
 mario._load_native_library = lambda: libraries.pop(0)
 mario.initialize_all_data = ensure_minimal_blender_data
-mario.get_surface_array_from_scene = lambda: ((mario.SM64Surface * 0)(), 0)
+mario._initialize_streamed_collision = lambda _session, _position: None
+mario._stream_collision_for_position = lambda _session, _position: False
 mario.start_input_reader = lambda: None
 mario.stop_input_reader = lambda: None
 mario.sample_input_reader = lambda _inputs: None

@@ -70,19 +70,20 @@ class PackageImportContractTests(unittest.TestCase):
                     if alias.name != "*":
                         self.assertIn(alias.name, symbols, "{}.{}".format(node.module, alias.name))
 
-    def test_collision_streaming_and_cache_runtime_are_absent(self):
+    def test_collision_streaming_runtime_is_mirrored_without_legacy_recreation(self):
         for base in (ROOT, PACKAGE):
             mario_source = (base / "mario.py").read_text(encoding="utf-8")
             init_source = (base / "__init__.py").read_text(encoding="utf-8")
-            self.assertFalse((base / "collision_cache.py").exists())
+            self.assertTrue((base / "collision_cache.py").exists())
+            self.assertIn("_stream_collision_for_position", mario_source)
+            self.assertIn("sm64_surface_object_create", mario_source)
             for forbidden in (
-                "collision_cache", "chunk_coordinate", "_handle_collision_boundary",
+                "_handle_collision_boundary",
                 "_replace_collision_and_mario",
                 "Could not recreate Mario after loading nearby collision",
             ):
                 self.assertNotIn(forbidden, mario_source)
-            self.assertNotIn("clear_collision_cache", init_source)
-            self.assertNotIn("ClearCollisionCache", init_source)
+            self.assertIn("collision_status_message", init_source)
 
     def test_static_surfaces_load_only_in_session_start(self):
         for base in (ROOT, PACKAGE):
@@ -96,6 +97,8 @@ class PackageImportContractTests(unittest.TestCase):
                 ):
                     owners.append(function.name)
             self.assertEqual(owners, ["_configure_native_api", "insert_mario"])
+            source = (base / "mario.py").read_text(encoding="utf-8")
+            self.assertIn("sm64_static_surfaces_load(empty_surfaces, 0)", source)
 
     def test_start_mark_api_is_explicit_and_recording_does_not_capture_it(self):
         mario_tree = ast.parse((PACKAGE / "mario.py").read_text(encoding="utf-8"))

@@ -48,6 +48,11 @@ assert mario.SM64Surface.vertices.offset == 8
 assert mario.ct.sizeof(mario.SM64MarioInputs) == 20
 assert mario.ct.sizeof(mario.SM64MarioState) == 60
 assert mario.ct.sizeof(mario.SM64MarioGeometryBuffers) == 40
+assert mario.ct.sizeof(mario.SM64ObjectTransform) == 24
+assert mario.ct.sizeof(mario.SM64SurfaceObject) == 40
+assert mario.SM64SurfaceObject.transform.offset == 0
+assert mario.SM64SurfaceObject.surfaceCount.offset == 24
+assert mario.SM64SurfaceObject.surfaces.offset == 32
 
 before = mario.lifecycle_snapshot()
 assert not before["global_init_attempted"]
@@ -61,6 +66,9 @@ for export_name in (
     "sm64_mario_tick",
     "sm64_mario_delete",
     "sm64_set_mario_faceangle",
+    "sm64_surface_object_create",
+    "sm64_surface_object_move",
+    "sm64_surface_object_delete",
 ):
     assert getattr(library, export_name) is not None
 mario._configure_native_api(library)
@@ -81,6 +89,14 @@ assert library.sm64_mario_delete.argtypes == [mario.ct.c_int32]
 assert library.sm64_set_mario_faceangle.argtypes == [
     mario.ct.c_int32, mario.ct.c_float,
 ]
+assert library.sm64_surface_object_create.argtypes == [
+    mario.ct.POINTER(mario.SM64SurfaceObject),
+]
+assert library.sm64_surface_object_create.restype is mario.ct.c_uint32
+assert library.sm64_surface_object_move.argtypes == [
+    mario.ct.c_uint32, mario.ct.POINTER(mario.SM64ObjectTransform),
+]
+assert library.sm64_surface_object_delete.argtypes == [mario.ct.c_uint32]
 for function_name in (
     "sm64_global_init",
     "sm64_global_terminate",
@@ -88,6 +104,8 @@ for function_name in (
     "sm64_mario_tick",
     "sm64_mario_delete",
     "sm64_set_mario_faceangle",
+    "sm64_surface_object_move",
+    "sm64_surface_object_delete",
 ):
     assert getattr(library, function_name).restype is None
 after = mario.lifecycle_snapshot()

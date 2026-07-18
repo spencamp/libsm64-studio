@@ -15,6 +15,10 @@ int main(void)
         "\"SM64MarioInputs\":{\"size\":%zu,\"camLookX\":%zu,\"camLookZ\":%zu,"
         "\"stickX\":%zu,\"stickY\":%zu,\"buttonA\":%zu,\"buttonB\":%zu,"
         "\"buttonZ\":%zu},"
+        "\"SM64ObjectTransform\":{\"size\":%zu,\"position\":%zu,"
+        "\"eulerRotation\":%zu},"
+        "\"SM64SurfaceObject\":{\"size\":%zu,\"transform\":%zu,"
+        "\"surfaceCount\":%zu,\"surfaces\":%zu},"
         "\"SM64MarioState\":{\"size\":%zu,\"position\":%zu,\"velocity\":%zu,"
         "\"faceAngle\":%zu,\"forwardVelocity\":%zu,\"health\":%zu,"
         "\"action\":%zu,\"animID\":%zu,\"animFrame\":%zu,\"flags\":%zu,"
@@ -36,6 +40,13 @@ int main(void)
         offsetof(struct SM64MarioInputs, buttonA),
         offsetof(struct SM64MarioInputs, buttonB),
         offsetof(struct SM64MarioInputs, buttonZ),
+        sizeof(struct SM64ObjectTransform),
+        offsetof(struct SM64ObjectTransform, position),
+        offsetof(struct SM64ObjectTransform, eulerRotation),
+        sizeof(struct SM64SurfaceObject),
+        offsetof(struct SM64SurfaceObject, transform),
+        offsetof(struct SM64SurfaceObject, surfaceCount),
+        offsetof(struct SM64SurfaceObject, surfaces),
         sizeof(struct SM64MarioState),
         offsetof(struct SM64MarioState, position),
         offsetof(struct SM64MarioState, velocity),

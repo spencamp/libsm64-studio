@@ -54,7 +54,7 @@ class AddonArchiveTests(unittest.TestCase):
                 )
                 self.assertIn('mesh.vertices.foreach_set("co", coordinates)', mario_source)
                 self.assertNotIn("bmesh.new()", mario_source)
-                self.assertNotIn("libsm64_studio/collision_cache.py", archive.namelist())
+                self.assertIn("libsm64_studio/collision_cache.py", archive.namelist())
                 self.assertEqual(
                     manifest["commit"],
                     "fd11813208272b4271d92bd92feb8f3fdbe61be5",

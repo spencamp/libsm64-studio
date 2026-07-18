@@ -49,7 +49,7 @@ if configured_install:
     ).digest()
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
     assert_init_import_contract(expected_package)
-    assert not (expected_package / "collision_cache.py").exists()
+    assert (expected_package / "collision_cache.py").is_file()
     assert not hasattr(addon, "clear_collision_cache")
     assert not hasattr(bpy.types, "ClearCollisionCache_OT_Operator")
 
@@ -60,7 +60,7 @@ if configured_install:
     addon = importlib.import_module("libsm64_studio")
     mario = importlib.import_module("libsm64_studio.mario")
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-    assert mario.RUNTIME_API_VERSION == 5
+    assert mario.RUNTIME_API_VERSION == 6
     assert_init_import_contract(expected_package)
     assert addon.BAKING == mario.BAKING
     assert addon.POISONED == mario.POISONED
@@ -103,7 +103,7 @@ else:
             addon = importlib.reload(addon)
             mario = importlib.import_module("libsm64_studio.mario")
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-            assert mario.RUNTIME_API_VERSION == 5
+            assert mario.RUNTIME_API_VERSION == 6
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
         finally:

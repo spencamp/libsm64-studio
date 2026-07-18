@@ -10,7 +10,7 @@ _MARIO_REQUIRED_API = (
     "reset_to_persistent_start_mark", "return_to_start_mark_after_transition",
     "set_persistent_start_mark",
 )
-_RUNTIME_API_VERSION = 5
+_RUNTIME_API_VERSION = 6
 
 
 def _reload_stale_runtime_modules():
@@ -57,7 +57,7 @@ bl_info = {
     "author" : "libsm64",
     "description" : "Record, bake, and edit Mario performances in Blender",
     "blender" : (2, 80, 0),
-    "version" : (2, 6, 0),
+    "version" : (2, 7, 0),
     "location" : "View3D > Sidebar > LibSM64 Studio",
     "warning" : "",
     "category" : "Generic"
@@ -79,6 +79,7 @@ from . mario import (
     abandon_bake_transition,
     begin_mario_recording,
     clear_persistent_start_mark,
+    collision_status_message,
     freeze_mario_recording_for_bake,
     get_live_mario_object,
     has_owned_native_session,
@@ -129,7 +130,7 @@ from .take_manager import (
 
 
 _confirmation_message = ""
-BUILD_ID = "2.6.0+libsm64-fd118132"
+BUILD_ID = "2.7.0+surface-streaming-fd118132"
 
 
 def _addon_preferences(context):
@@ -310,6 +311,8 @@ class Main_PT_Panel(bpy.types.Panel):
                 box.label(text=live_control_error(), icon='INFO')
         else:
             box.label(text="Live Mario: Unavailable", icon='ERROR')
+        if has_owned_native_session():
+            box.label(text=collision_status_message(), icon='MESH_GRID')
 
         mark_row = box.row(align=True)
         mark_row.enabled = control_status == LIVE_IDLE

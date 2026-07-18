@@ -57,13 +57,23 @@ cleanup.
 
 ### Scene collision
 
-**Start Live Mario** extracts eligible scene meshes and loads one static collision
-set before Mario is created. That collision remains unchanged until the Studio
-Session ends. Large scenes can therefore take longer to initialize, and geometry
-outside the native signed 32-bit coordinate range relative to the 3D cursor is
-omitted with a diagnostic. The modern fields remove the old ABI's signed-16-bit
-coordinate restriction; this does not imply unlimited scene size or guarantee
-native broadphase behavior at every scale.
+**Start Live Mario** prepares a fixed 3x3 neighborhood of 256-Blender-unit
+world-space X/Y chunks around the 3D cursor and creates one native surface object
+per non-empty chunk before Mario is created. As Mario crosses chunk boundaries,
+incoming chunks are created first and distant chunks outside a 5x5 retention
+neighborhood are deleted afterward. Mario remains the same native instance, so
+movement, Start Marks, and recording continue across transitions.
+
+Collision extraction uses evaluated meshes, modifiers, world transforms,
+Fast64/simple surface types, and terrain metadata. Object and clipped-chunk data
+are cached for the Studio Session. Clearly distant separate objects receive only
+an inexpensive bounds scan until their chunks are needed; a very large joined
+mesh may still need one expensive extraction because Blender exposes it as one
+object. If relevant scene collision changes while Live Mario is running, Studio
+marks it dirty and shows a restart notice instead of silently replacing the
+currently active native collision. The modern 32-bit fields remove the old
+signed-16-bit storage restriction, but scene size and libsm64 broadphase behavior
+are not unlimited.
 
 ## Capture a Mario performance
 
@@ -183,8 +193,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_blender_tests.ps1 `
 
 The child validates the packaged manifest/hash and ctypes layouts before DLL
 load, validates the ROM SHA-1, allocates the exact texture buffer, then exercises
-global initialization, static collision load, Mario creation, one tick, Mario
-deletion, and global termination. Every native boundary is printed with
+global initialization, an empty static load, two initial surface objects, Mario
+creation, a tick, an incoming surface-object create, distant-object deletion, a
+second tick with the same Mario ID, remaining surface deletion, Mario deletion,
+and global termination. Every native boundary is printed with
 `LIBSM64_NATIVE_STAGE` and flushed immediately. Global termination is never
 called when initialization did not return successfully. The runner warns and
 omits this ROM-backed gate when neither `-RomPath` nor `LIBSM64_TEST_ROM` is set;
@@ -208,8 +220,9 @@ profile, opens an existing `.blend`, or attaches to another Blender process.
 The automated suite covers packaged add-on import and lifecycle registration,
 timer-driven live control, persistent Start Mark transitions and ownership,
 native lifecycle ownership, real bundled-library ABI loading without a ROM,
-the optional crash-isolated ROM-backed native lifecycle, whole-scene 32-bit
-collision conversion, and the three-take regression. The controller feel,
+the optional crash-isolated ROM-backed native lifecycle, evaluated collision
+caching/clipping, transactional surface-object streaming, 32-bit conversion,
+and the three-take regression. The controller feel,
 viewport redraw/appearance, material preview,
 Eevee/Cycles rendering, and interactive playback/scrubbing checks below still
 require a normal GUI Blender session.
@@ -230,21 +243,27 @@ The current bundled hashes are:
 - `sm64.dll`: `6f51ec90ef15d2eead509cfcd863162416f24541cf16e94bbd138526cddf873f`
 - `libsm64.so`: `44a586475df7254f272d20a969e6a25442834f1cc1427c7b40c0ec5592257656`
 
-### Phase 1 manual acceptance
+### Phase 2 manual acceptance
 
 After all automated tests pass, perform this check in a normal Blender session:
 
 1. Clean-install the generated add-on ZIP.
 2. Start Blender 5.2 with a valid SM64 US ROM.
 3. Start Live Mario over simple collision and confirm normal texture and controls.
-4. Move beyond the old signed-16-bit collision-coordinate range in a suitable scene.
-5. Set and reset a Start Mark.
-6. Record a short run with turns and a jump, then bake it.
-7. Confirm object-transform movement and Mario-local pose shape keys still work.
-8. Record a second take and verify the first remains unchanged.
-9. End the Studio Session, then start and end another session.
-10. Confirm there is no Blender crash, duplicate native cleanup, or stale timer.
-11. Save and reopen the file; confirm baked takes remain independent of the native runtime.
+4. Run across several chunk boundaries; confirm no pause, teleport, momentum,
+   facing, or Mario-ID reset.
+5. Record continuously across boundaries, bake, and confirm transform movement
+   and local-pose shape keys remain continuous.
+6. Return to previously visited and negative-coordinate chunks and inspect cache
+   diagnostics.
+7. Test a large joined mesh, an exact-boundary wall, and many distant separate objects.
+8. Set and reset a Start Mark after several transitions.
+9. End and restart the Studio Session five times, then manually delete Live Mario
+   and start one more session.
+10. Confirm active native objects remain bounded and no ownership, rollback,
+    duplicate-cleanup, crash, or stale-timer error appears in the console.
+11. Save and reopen the file without the ROM; confirm baked takes remain independent
+    of the native runtime.
 
 Record the platform, Blender build, package hash, and result separately. Do not
 treat this checklist as performed merely because the automated suite passed.
@@ -316,9 +335,11 @@ single packed image from the ROM; it does not create a texture per take.
 - Review, favorite, reject, restore, and retain multiple takes in the `.blend`.
 - Render and reopen baked performances without libsm64, a ROM, or a controller.
 - Use Fast64 terrain and collision metadata when it is present in a scene.
+- Stream nearby static scene collision automatically through native surface
+  objects while keeping one Mario alive across region transitions.
 
-Phase 1 remains compatibility-only: collision is still one whole-scene static
-load. Dynamic surface objects, moving platforms, water/gas controls, cap
+Phase 2 streams static scene geometry; it does not move chunk transforms after
+creation. Moving platforms, real-time collision editing, water/gas controls, cap
 controls, audio, richer Start Mark restoration, damage/health controls,
 collision queries, and an armature are not implemented.
 

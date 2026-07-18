@@ -1,6 +1,6 @@
 # Reproducing the pinned libsm64 binaries
 
-LibSM64 Studio Phase 1 pins `libsm64/libsm64` at the full commit
+LibSM64 Studio Phase 2 continues the Phase 1 pin of `libsm64/libsm64` at the full commit
 `fd11813208272b4271d92bd92feb8f3fdbe61be5`. Both packaged artifacts must be
 built from that same revision through upstream's `make lib` target. Never copy
 a ROM, `run-test`, generated `build/` directories, or unrelated upstream files

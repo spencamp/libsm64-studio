@@ -1,5 +1,6 @@
 import bpy
 from array import array
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -10,6 +11,13 @@ import mathutils
 import uuid
 from typing import cast, List
 from . collision_types import COLLISION_TYPES
+from .collision_cache import (
+    CHUNK_SIZE_BLENDER,
+    CollisionCache,
+    chunk_coordinate,
+    native_chunk_payload,
+    plan_transition,
+)
 from . recording import recorder
 
 if platform.system() == 'Windows':
@@ -41,13 +49,20 @@ BAKING = "BAKING"
 RESETTING = "RESETTING"
 POISONED = "POISONED"
 
+SURFACE_PREPARED = "prepared"
+SURFACE_CREATE_ATTEMPTED = "create attempted"
+SURFACE_CREATED = "created"
+SURFACE_DELETE_ATTEMPTED = "delete attempted"
+SURFACE_DELETED = "deleted"
+SURFACE_FAILED = "failed/uncertain"
+
 origin_offset = [0.0, 0.0, 0.0]
 original_fps = 0
 original_fps_setting = 0
 original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
 simulation_scene = None
-RUNTIME_API_VERSION = 5
+RUNTIME_API_VERSION = 6
 
 SM64SurfaceVertex = ct.c_int32 * 3
 SM64SurfaceVertices = SM64SurfaceVertex * 3
@@ -68,6 +83,19 @@ class SM64MarioInputs(ct.Structure):
     ]
 
 Float3 = ct.c_float * 3
+
+class SM64ObjectTransform(ct.Structure):
+    _fields_ = [
+        ('position', Float3),
+        ('eulerRotation', Float3),
+    ]
+
+class SM64SurfaceObject(ct.Structure):
+    _fields_ = [
+        ('transform', SM64ObjectTransform),
+        ('surfaceCount', ct.c_uint32),
+        ('surfaces', ct.POINTER(SM64Surface)),
+    ]
 
 class SM64MarioState(ct.Structure):
     _fields_ = [
@@ -111,6 +139,18 @@ class MarioLifecycleError(RuntimeError):
     pass
 
 
+@dataclass
+class NativeSurfaceOwnership:
+    chunk_key: tuple
+    owner_token: str
+    generation: int
+    surface_count: int
+    state: str = SURFACE_PREPARED
+    object_id: object = None
+    creation_order: int = 0
+    diagnostic: str = ""
+
+
 def _native_stage(stage):
     """Emit a crash-resilient native boundary marker for console/subprocess logs."""
     print("{} {}".format(NATIVE_STAGE_PREFIX, stage), flush=True)
@@ -132,6 +172,8 @@ def _validate_ctypes_abi_layout(structure_overrides=None):
     structures = {
         "SM64Surface": SM64Surface,
         "SM64MarioInputs": SM64MarioInputs,
+        "SM64ObjectTransform": SM64ObjectTransform,
+        "SM64SurfaceObject": SM64SurfaceObject,
         "SM64MarioState": SM64MarioState,
         "SM64MarioGeometryBuffers": SM64MarioGeometryBuffers,
     }
@@ -153,6 +195,15 @@ def _validate_ctypes_abi_layout(structure_overrides=None):
             ('buttonA', ct.c_uint8),
             ('buttonB', ct.c_uint8),
             ('buttonZ', ct.c_uint8),
+        ),
+        "SM64ObjectTransform": (
+            ('position', Float3),
+            ('eulerRotation', Float3),
+        ),
+        "SM64SurfaceObject": (
+            ('transform', SM64ObjectTransform),
+            ('surfaceCount', ct.c_uint32),
+            ('surfaces', ct.POINTER(SM64Surface)),
         ),
         "SM64MarioState": (
             ('position', Float3),
@@ -184,9 +235,17 @@ def _validate_ctypes_abi_layout(structure_overrides=None):
     if pointer_size not in (4, 8):
         _abi_layout_failure("native pointer size", "4 or 8 bytes", pointer_size)
 
+    surface_pointer_offset = ((28 + pointer_size - 1) // pointer_size) * pointer_size
+    surface_object_size = (
+        (surface_pointer_offset + pointer_size + pointer_size - 1)
+        // pointer_size * pointer_size
+    )
+
     expected_sizes = {
         "SM64Surface": 44,
         "SM64MarioInputs": 20,
+        "SM64ObjectTransform": 24,
+        "SM64SurfaceObject": surface_object_size,
         "SM64MarioState": 60,
         "SM64MarioGeometryBuffers": ((4 * pointer_size + 2 + pointer_size - 1)
                                       // pointer_size * pointer_size),
@@ -198,6 +257,13 @@ def _validate_ctypes_abi_layout(structure_overrides=None):
         "SM64MarioInputs": {
             "camLookX": 0, "camLookZ": 4, "stickX": 8, "stickY": 12,
             "buttonA": 16, "buttonB": 17, "buttonZ": 18,
+        },
+        "SM64ObjectTransform": {
+            "position": 0, "eulerRotation": 12,
+        },
+        "SM64SurfaceObject": {
+            "transform": 0, "surfaceCount": 24,
+            "surfaces": surface_pointer_offset,
         },
         "SM64MarioState": {
             "position": 0, "velocity": 12, "faceAngle": 24,
@@ -239,6 +305,8 @@ class NativeLifecycle:
         self.mario_id = -1
         self.tick_handler = None
         self.tick_handler_installed = False
+        self.collision_update_handler = None
+        self.collision_update_handler_installed = False
         self.timer_callback = None
         self.timer_installed = False
         self.control_state = STOPPED
@@ -256,6 +324,26 @@ class NativeLifecycle:
         self.live_object_name = ""
         self.scene = None
         self.input_started = False
+        self.collision_cache = CollisionCache()
+        self.native_surface_objects = {}
+        self.active_chunk_keys = set()
+        self.collision_center = None
+        self.pending_transition_state = "idle"
+        self.surface_create_count = 0
+        self.surface_delete_count = 0
+        self.active_surface_count = 0
+        self.collision_stats = {
+            "objects_scanned_by_bounds": 0,
+            "objects_evaluated": 0,
+            "object_cache_hits": 0,
+            "object_cache_misses": 0,
+            "chunk_cache_hits": 0,
+            "chunk_cache_misses": 0,
+            "chunks_prepared": 0,
+        }
+        self.last_collision_error = ""
+        self.last_stream_seconds = 0.0
+        self.collision_changed_while_live = False
 
 
 _MODULE_OWNER_TOKEN = uuid.uuid4().hex
@@ -382,6 +470,7 @@ def lifecycle_snapshot():
         "mario_created": session.mario_created,
         "mario_id": session.mario_id,
         "tick_handler_installed": session.tick_handler_installed,
+        "collision_update_handler_installed": session.collision_update_handler_installed,
         "timer_installed": session.timer_installed,
         "control_state": session.control_state,
         "last_error": session.last_error,
@@ -389,6 +478,24 @@ def lifecycle_snapshot():
         "shutdown_in_progress": session.shutdown_in_progress,
         "shutdown_complete": session.shutdown_complete,
         "session_committed": session.session_committed,
+        "active_native_surface_object_count": sum(
+            1 for record in session.native_surface_objects.values()
+            if record.object_id is not None and record.state in (
+                SURFACE_CREATED, SURFACE_DELETE_ATTEMPTED, SURFACE_FAILED,
+            )
+        ),
+        "owned_surface_ids": tuple(sorted(
+            int(record.object_id) for record in session.native_surface_objects.values()
+            if record.object_id is not None
+        )),
+        "active_chunk_keys": tuple(sorted(session.active_chunk_keys)),
+        "pending_transition_state": session.pending_transition_state,
+        "surface_create_count": session.surface_create_count,
+        "surface_delete_count": session.surface_delete_count,
+        "active_surface_count": session.active_surface_count,
+        "last_collision_error": session.last_collision_error,
+        "collision_changed_while_live": session.collision_changed_while_live,
+        "collision_stats": dict(session.collision_stats),
     }
 
 
@@ -526,6 +633,8 @@ def _validate_manifest_abi_probe(manifest):
     structures = {
         "SM64Surface": SM64Surface,
         "SM64MarioInputs": SM64MarioInputs,
+        "SM64ObjectTransform": SM64ObjectTransform,
+        "SM64SurfaceObject": SM64SurfaceObject,
         "SM64MarioState": SM64MarioState,
         "SM64MarioGeometryBuffers": SM64MarioGeometryBuffers,
     }
@@ -611,7 +720,7 @@ def _load_native_library():
 
 
 def _configure_native_api(library):
-    """Validate and configure the Phase-1 API from the pinned libsm64.h."""
+    """Validate and configure the Phase-2 API from the pinned libsm64.h."""
     _validate_ctypes_abi_layout()
     required_exports = (
         "sm64_global_init",
@@ -621,6 +730,9 @@ def _configure_native_api(library):
         "sm64_mario_tick",
         "sm64_mario_delete",
         "sm64_set_mario_faceangle",
+        "sm64_surface_object_create",
+        "sm64_surface_object_move",
+        "sm64_surface_object_delete",
     )
     missing = [name for name in required_exports if not hasattr(library, name)]
     if missing:
@@ -652,6 +764,14 @@ def _configure_native_api(library):
     library.sm64_mario_tick.restype = None
     library.sm64_set_mario_faceangle.argtypes = [ct.c_int32, ct.c_float]
     library.sm64_set_mario_faceangle.restype = None
+    library.sm64_surface_object_create.argtypes = [ct.POINTER(SM64SurfaceObject)]
+    library.sm64_surface_object_create.restype = ct.c_uint32
+    library.sm64_surface_object_move.argtypes = [
+        ct.c_uint32, ct.POINTER(SM64ObjectTransform),
+    ]
+    library.sm64_surface_object_move.restype = None
+    library.sm64_surface_object_delete.argtypes = [ct.c_uint32]
+    library.sm64_surface_object_delete.restype = None
     _native_stage("after_abi_configuration")
 
 
@@ -746,6 +866,308 @@ def _prepare_blender_for_insert():
     bpy.ops.object.select_all(action='DESELECT')
 
 
+def _record_collision_stats(session, stats):
+    values = stats.as_dict()
+    for key in session.collision_stats:
+        session.collision_stats[key] += int(values.get(key, 0))
+    session.last_stream_seconds = float(values.get("duration_seconds", 0.0))
+
+
+def collision_diagnostics():
+    snapshot = lifecycle_snapshot()
+    return {
+        "active_chunks": len(snapshot["active_chunk_keys"]),
+        "active_native_objects": snapshot["active_native_surface_object_count"],
+        "active_surfaces": snapshot["active_surface_count"],
+        "cache": snapshot["collision_stats"],
+        "last_stream_seconds": _lifecycle.last_stream_seconds,
+        "last_error": snapshot["last_collision_error"],
+    }
+
+
+def collision_status_message():
+    diagnostics = collision_diagnostics()
+    cache = diagnostics["cache"]
+    message = (
+        "Collision: {} active chunks / {:,} surfaces | Cache: {} hits / {} misses | "
+        "Last stream: {:.1f} ms".format(
+            diagnostics["active_chunks"], diagnostics["active_surfaces"],
+            cache["chunk_cache_hits"], cache["chunk_cache_misses"],
+            diagnostics["last_stream_seconds"] * 1000.0,
+        )
+    )
+    if _lifecycle.collision_changed_while_live:
+        message += " | Scene collision changed: restart Live Mario to refresh active chunks"
+    return message
+
+
+def _collision_object_is_eligible(obj):
+    return bool(
+        getattr(obj, "type", None) == "MESH"
+        and not obj.get("libsm64_is_bake", False)
+        and not obj.get(LIVE_ROLE, "")
+    )
+
+
+def _make_collision_update_handler(session):
+    def collision_update(_scene, depsgraph):
+        if not _session_is_registered_owner(session) or session.shutdown_in_progress:
+            return
+        affected = []
+        for update in getattr(depsgraph, "updates", ()):
+            data = getattr(update, "id", None)
+            if isinstance(data, bpy.types.Object):
+                if _collision_object_is_eligible(data):
+                    affected.append(data)
+                elif session.scene is not None:
+                    # A Fast64 Area Root or another collision parent can own
+                    # terrain metadata inherited by descendant meshes.
+                    for obj in session.scene.objects:
+                        parent = getattr(obj, "parent", None)
+                        while parent is not None:
+                            if parent is data:
+                                if _collision_object_is_eligible(obj):
+                                    affected.append(obj)
+                                break
+                            parent = getattr(parent, "parent", None)
+            elif isinstance(data, bpy.types.Mesh) and session.scene is not None:
+                affected.extend(
+                    obj for obj in session.scene.objects
+                    if getattr(obj, "data", None) is data and _collision_object_is_eligible(obj)
+                )
+            elif isinstance(data, bpy.types.Material) and session.scene is not None:
+                affected.extend(
+                    obj for obj in session.scene.objects
+                    if _collision_object_is_eligible(obj)
+                    and data in getattr(getattr(obj, "data", None), "materials", ())
+                )
+        if not affected:
+            return
+        for obj in affected:
+            session.collision_cache.mark_object_dirty(obj)
+        session.collision_changed_while_live = True
+        session.last_collision_error = (
+            "Scene collision changed during generation {}; active chunks retain their safe "
+            "session snapshot. Restart Live Mario to refresh them; dirty cached geometry will "
+            "be rebuilt before any later chunk preparation.".format(session.generation)
+        )
+
+    collision_update.__name__ = "libsm64_collision_update"
+    collision_update._libsm64_owner_token = session.owner_token
+    collision_update._libsm64_generation = session.generation
+    return collision_update
+
+
+def _install_collision_update_handler(session):
+    if session.collision_update_handler is None:
+        session.collision_update_handler = _make_collision_update_handler(session)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    if session.collision_update_handler not in handlers:
+        handlers.append(session.collision_update_handler)
+    session.collision_update_handler_installed = True
+
+
+def _prepare_collision_chunks(session, keys):
+    prepared, stats = session.collision_cache.prepare_chunks(
+        session.scene,
+        keys,
+        SM64_SCALE_FACTOR,
+        COLLISION_TYPES,
+        depsgraph=bpy.context.evaluated_depsgraph_get(),
+        chunk_size=CHUNK_SIZE_BLENDER,
+    )
+    _record_collision_stats(session, stats)
+    return prepared
+
+
+def _surface_record_is_owned(session, record):
+    return (
+        record.owner_token == session.owner_token
+        and record.generation == session.generation
+        and session.native_surface_objects.get(record.chunk_key) is record
+    )
+
+
+def _create_native_surface_object(session, chunk):
+    if not _session_is_registered_owner(session):
+        raise MarioLifecycleError("Collision create rejected for a stale lifecycle generation")
+    if chunk.key in session.native_surface_objects:
+        raise MarioLifecycleError("Collision chunk {} already has an ownership record".format(chunk.key))
+    record = NativeSurfaceOwnership(
+        chunk_key=chunk.key,
+        owner_token=session.owner_token,
+        generation=session.generation,
+        surface_count=chunk.surface_count,
+        creation_order=session.surface_create_count + 1,
+    )
+    session.native_surface_objects[chunk.key] = record
+    if chunk.surface_count == 0:
+        record.state = SURFACE_DELETED
+        session.native_surface_objects.pop(chunk.key, None)
+        return None
+    surfaces, translation = native_chunk_payload(
+        chunk,
+        SM64_SCALE_FACTOR,
+        origin_offset,
+        SM64Surface,
+        chunk_size=CHUNK_SIZE_BLENDER,
+    )
+    transform = SM64ObjectTransform()
+    transform.position[:] = translation
+    transform.eulerRotation[:] = (0.0, 0.0, 0.0)
+    descriptor = SM64SurfaceObject()
+    descriptor.transform = transform
+    descriptor.surfaceCount = chunk.surface_count
+    descriptor.surfaces = ct.cast(surfaces, ct.POINTER(SM64Surface))
+    record.state = SURFACE_CREATE_ATTEMPTED
+    try:
+        _native_stage("before_surface_object_create {}".format(chunk.key))
+        object_id = int(session.library.sm64_surface_object_create(ct.byref(descriptor)))
+    except Exception as exc:
+        record.state = SURFACE_FAILED
+        record.diagnostic = str(exc)
+        session.last_collision_error = (
+            "chunk {} create failed in generation {}: {}".format(
+                chunk.key, session.generation, exc
+            )
+        )
+        raise
+    record.object_id = object_id
+    record.state = SURFACE_CREATED
+    session.surface_create_count += 1
+    session.active_surface_count += chunk.surface_count
+    _native_stage("after_surface_object_create {}".format(chunk.key))
+    # Upstream copies the entire SM64Surface array before returning.  The
+    # temporary ctypes array intentionally dies with this stack frame.
+    return record
+
+
+def _delete_native_surface_object(session, chunk_key, operation="delete"):
+    record = session.native_surface_objects.get(chunk_key)
+    if record is None:
+        return False
+    if not _surface_record_is_owned(session, record):
+        session.native_ownership_uncertain = True
+        raise MarioLifecycleError(
+            "Collision {} rejected for stale ownership of chunk {}".format(operation, chunk_key)
+        )
+    if record.object_id is None:
+        session.native_surface_objects.pop(chunk_key, None)
+        return False
+    if record.state in (SURFACE_DELETE_ATTEMPTED, SURFACE_DELETED):
+        raise MarioLifecycleError("Collision object {} would be deleted twice".format(record.object_id))
+    record.state = SURFACE_DELETE_ATTEMPTED
+    try:
+        _native_stage("before_surface_object_delete {}".format(chunk_key))
+        session.library.sm64_surface_object_delete(record.object_id)
+        _native_stage("after_surface_object_delete {}".format(chunk_key))
+    except Exception as exc:
+        record.state = SURFACE_FAILED
+        record.diagnostic = str(exc)
+        session.native_ownership_uncertain = True
+        session.last_collision_error = (
+            "chunk {} {} failed in generation {}; ownership is uncertain: {}".format(
+                chunk_key, operation, session.generation, exc
+            )
+        )
+        raise
+    record.state = SURFACE_DELETED
+    session.surface_delete_count += 1
+    session.active_surface_count -= record.surface_count
+    # IDs may be reused by upstream.  Remove successful ownership immediately
+    # so this generation can never delete the old numeric ID twice.
+    session.native_surface_objects.pop(chunk_key, None)
+    return True
+
+
+def _rollback_surface_creates(session, created_keys):
+    for chunk_key in reversed(created_keys):
+        _delete_native_surface_object(session, chunk_key, operation="rollback")
+
+
+def _create_incoming_chunks(session, prepared, incoming):
+    created_keys = []
+    try:
+        for key in incoming:
+            record = _create_native_surface_object(session, prepared[key])
+            if record is not None:
+                created_keys.append(key)
+    except Exception as create_exc:
+        try:
+            _rollback_surface_creates(session, created_keys)
+        except Exception as rollback_exc:
+            session.native_ownership_uncertain = True
+            session.pending_transition_state = "rollback failed"
+            _poison_session(
+                session,
+                "Collision rollback failed; restart Blender. Create error: {}; rollback error: {}".format(
+                    create_exc, rollback_exc
+                ),
+            )
+            raise MarioLifecycleError(session.last_error) from rollback_exc
+        session.pending_transition_state = "create failed; rolled back"
+        _poison_session(session, session.last_collision_error or str(create_exc))
+        raise MarioLifecycleError(session.last_error) from create_exc
+    return created_keys
+
+
+def _initialize_streamed_collision(session, world_position):
+    center = chunk_coordinate(world_position, CHUNK_SIZE_BLENDER)
+    plan = plan_transition((), center)
+    session.pending_transition_state = "preparing initial chunks"
+    prepared = _prepare_collision_chunks(session, plan.incoming)
+    if not any(chunk.surface_count for chunk in prepared.values()):
+        session.pending_transition_state = "initial collision empty"
+        raise MarioLifecycleError("There is no ground under the 3D cursor where Mario can spawn")
+    session.pending_transition_state = "creating initial chunks"
+    _create_incoming_chunks(session, prepared, plan.incoming)
+    session.active_chunk_keys.update(plan.incoming)
+    session.collision_center = center
+    session.pending_transition_state = "idle"
+    _lifecycle_log(
+        session,
+        "initial collision: {} chunks, {} native objects, {} surfaces".format(
+            len(session.active_chunk_keys), len(session.native_surface_objects),
+            session.active_surface_count,
+        ),
+    )
+
+
+def _stream_collision_for_position(session, world_position):
+    center = chunk_coordinate(world_position, CHUNK_SIZE_BLENDER)
+    plan = plan_transition(session.active_chunk_keys, center)
+    if not plan.incoming and not plan.outgoing:
+        session.collision_center = center
+        return False
+    session.pending_transition_state = "preparing incoming {}".format(plan.incoming)
+    prepared = _prepare_collision_chunks(session, plan.incoming)
+    session.pending_transition_state = "creating incoming {}".format(plan.incoming)
+    _create_incoming_chunks(session, prepared, plan.incoming)
+    # Commit every incoming key, including empty prepared chunks, before any
+    # outgoing deletion.  This is the collision-gap prevention boundary.
+    session.active_chunk_keys.update(plan.incoming)
+    session.pending_transition_state = "deleting outgoing {}".format(plan.outgoing)
+    try:
+        for key in plan.outgoing:
+            _delete_native_surface_object(session, key)
+            session.active_chunk_keys.discard(key)
+    except Exception as exc:
+        session.pending_transition_state = "outgoing delete failed"
+        _poison_session(session, session.last_collision_error or str(exc))
+        raise MarioLifecycleError(session.last_error) from exc
+    session.collision_center = center
+    session.pending_transition_state = "idle"
+    _lifecycle_log(
+        session,
+        "collision streamed: center={} incoming={} outgoing={} active={} surfaces={} {:.1f}ms".format(
+            center, len(plan.incoming), len(plan.outgoing),
+            len(session.active_chunk_keys), session.active_surface_count,
+            session.last_stream_seconds * 1000.0,
+        ),
+    )
+    return True
+
+
 def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     global _lifecycle, sm64, sm64_mario_id
     global SM64_SCALE_FACTOR, original_fps, original_fps_setting
@@ -780,6 +1202,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         origin_offset[0] = bpy.context.scene.cursor.location.x
         origin_offset[1] = bpy.context.scene.cursor.location.y
         origin_offset[2] = bpy.context.scene.cursor.location.z
+        session.scene = bpy.context.scene
 
         recorder.cancel("Ready for a new take")
 
@@ -809,11 +1232,15 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         _lifecycle_log(session, "global init succeeded")
         initialize_all_data(texture_buff)
 
-        print("Preparing scene collision\u2026")
-        (surface_array, surface_array_len) = get_surface_array_from_scene()
+        # Dynamic surface objects carry all Studio scene collision.  Keep the
+        # pinned static API initialized with an explicitly empty set so no
+        # geometry is represented in both systems.
+        empty_surfaces = (SM64Surface * 0)()
         _native_stage("before_static_surface_load")
-        session.library.sm64_static_surfaces_load(surface_array, surface_array_len)
+        session.library.sm64_static_surfaces_load(empty_surfaces, 0)
         _native_stage("after_static_surface_load")
+        print("Preparing nearby streamed collision\u2026")
+        _initialize_streamed_collision(session, tuple(original_cursor_pos))
 
         session.mario_create_attempted = True
         _lifecycle_log(session, "Mario create started")
@@ -836,7 +1263,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         start_input_reader()
         session.input_started = True
 
-        simulation_scene = bpy.context.scene
+        simulation_scene = session.scene
         session.scene = simulation_scene
         original_fps_setting = simulation_scene.render.fps
         original_fps_base = simulation_scene.render.fps_base
@@ -844,6 +1271,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         tick_count = 0
         session.session_committed = True
         session.control_state = LIVE_IDLE
+        _install_collision_update_handler(session)
         _install_tick_timer(session)
         return None
     except Exception as exc:
@@ -873,6 +1301,20 @@ def remove_tick_mario_handlers(session=None):
     if removed or session.tick_handler_installed:
         _lifecycle_log(session, "tick removed")
     session.tick_handler_installed = False
+    collision_handlers = bpy.app.handlers.depsgraph_update_post
+    collision_removed = 0
+    for handler in list(collision_handlers):
+        if (
+            handler is session.collision_update_handler
+            or (
+                getattr(handler, '_libsm64_owner_token', None) == session.owner_token
+                and getattr(handler, '_libsm64_generation', None) == session.generation
+                and getattr(handler, '__name__', '') == 'libsm64_collision_update'
+            )
+        ):
+            collision_handlers.remove(handler)
+            collision_removed += 1
+    session.collision_update_handler_installed = False
     return removed
 
 
@@ -1250,6 +1692,13 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
     was_running = session.session_committed
     remove_tick_mario_timer(session)
     remove_tick_mario_handlers(session)
+    if session.input_started:
+        try:
+            stop_input_reader()
+        except Exception as exc:
+            errors.append("Input cleanup failed: {}".format(exc))
+        session.input_started = False
+    _disable_keyboard_control()
     if scene is not None:
         scene.cursor.location = (
             original_cursor_pos[0],
@@ -1257,7 +1706,38 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             original_cursor_pos[2]
         )
     try:
-        if session.mario_created and not session.mario_delete_attempted:
+        surface_cleanup_safe = not session.native_ownership_uncertain
+        if session.native_ownership_uncertain:
+            errors.append("Surface-object cleanup skipped because native ownership is already uncertain")
+            _lifecycle_log(session, "surface cleanup skipped: native ownership is uncertain")
+        elif session.native_surface_objects:
+            if not (session.library_loaded and session.global_initialized and session.library):
+                errors.append("Surface-object state is inconsistent; native cleanup skipped")
+                session.native_ownership_uncertain = True
+                surface_cleanup_safe = False
+            else:
+                owned_records = sorted(
+                    tuple(session.native_surface_objects.values()),
+                    key=lambda record: record.creation_order,
+                    reverse=True,
+                )
+                for record in owned_records:
+                    try:
+                        _delete_native_surface_object(session, record.chunk_key, operation="shutdown")
+                    except Exception as exc:
+                        errors.append("Surface object delete failed: {}".format(exc))
+                        surface_cleanup_safe = False
+                        # Once one ID is uncertain, make no further native calls.
+                        break
+        if surface_cleanup_safe:
+            session.active_chunk_keys.clear()
+            session.active_surface_count = 0
+
+        if not surface_cleanup_safe:
+            if session.mario_created:
+                errors.append("Mario deletion skipped because surface ownership is uncertain")
+                _lifecycle_log(session, "Mario delete skipped: surface ownership is uncertain")
+        elif session.mario_created and not session.mario_delete_attempted:
             if not (session.library_loaded and session.global_initialized and session.library):
                 errors.append("Mario state is inconsistent; native delete skipped")
                 _lifecycle_log(session, "Mario delete skipped: lifecycle prerequisites are not valid")
@@ -1317,6 +1797,8 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             bpy.data.objects.remove(live_object, do_unlink=True)
         session.live_object = None
         session.live_object_name = ""
+        session.collision_cache.clear()
+        session.pending_transition_state = "shutdown"
         session.library = None
         session.library_loaded = False
         session.session_committed = False
@@ -1403,6 +1885,10 @@ def tick_mario(scene, depsgraph=None, _session=None):
     mario_world_location = native_position_to_blender(
         mario_state.position[0], mario_state.position[1], mario_state.position[2]
     )
+    # Stream only after a complete native tick has supplied Mario's position.
+    # Incoming objects are committed before distant objects are deleted, and
+    # the Mario ID/state/recording timeline are never touched by this path.
+    _stream_collision_for_position(session, mario_world_location)
 
     if follow_cam:
         scene.cursor.location = (

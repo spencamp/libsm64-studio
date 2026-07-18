@@ -99,7 +99,7 @@ function Install-StagedPackageClean {
 try {
     New-Item -ItemType Directory -Path $stagedPackage, $addonRoot, $userConfig, $userData, $userExtensions, $blendRoot -Force | Out-Null
 
-    foreach ($name in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "input_reader.py", "input_reader_win.py", "collision_types.py", "zeth_inputs.py")) {
+    foreach ($name in @("__init__.py", "mario.py", "collision_cache.py", "recording.py", "take_manager.py", "input_reader.py", "input_reader_win.py", "collision_types.py", "zeth_inputs.py")) {
         Assert-MirrorFile $name
     }
 
@@ -120,7 +120,7 @@ try {
         throw "Could not stage packaged add-on files (a file may be locked): $($_.Exception.Message)"
     }
 
-    foreach ($required in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "lib\libsm64-build.json", "lib\sm64.dll", "lib\libsm64.so", "lib\SDL2.dll")) {
+    foreach ($required in @("__init__.py", "mario.py", "collision_cache.py", "recording.py", "take_manager.py", "lib\libsm64-build.json", "lib\sm64.dll", "lib\libsm64.so", "lib\SDL2.dll")) {
         if (-not (Test-Path -LiteralPath (Join-Path $stagedPackage $required) -PathType Leaf)) {
             throw "Staged add-on is missing required file: libsm64_studio\$required"
         }
@@ -173,13 +173,10 @@ try {
         if ($entryDifference) {
             throw "Generated add-on ZIP contents differ from the staged install: $($entryDifference | Out-String)"
         }
-        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/lib/libsm64-build.json", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/libsm64.so", "libsm64_studio/lib/SDL2.dll")) {
+        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/collision_cache.py", "libsm64_studio/lib/libsm64-build.json", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/libsm64.so", "libsm64_studio/lib/SDL2.dll")) {
             if ($entries -notcontains $required) {
                 throw "Generated add-on ZIP is missing $required"
             }
-        }
-        if ($entries -contains "libsm64_studio/collision_cache.py") {
-            throw "Generated add-on ZIP retained removed collision_cache.py"
         }
     } finally {
         $zip.Dispose()
@@ -236,10 +233,12 @@ try {
     if (-not $SmokeOnly) {
         Invoke-BlenderTest "bulk mesh update regression" (Join-Path $repoRoot "tests\blender_mesh_update_test.py")
         Invoke-BlenderTest "static collision regression" (Join-Path $repoRoot "tests\blender_static_collision_test.py")
+        Invoke-BlenderTest "evaluated collision cache regression" (Join-Path $repoRoot "tests\blender_collision_cache_test.py")
         Invoke-BlenderTest "live control regression" (Join-Path $repoRoot "tests\blender_live_control_test.py")
         Invoke-BlenderTest "Start Mark regression" (Join-Path $repoRoot "tests\blender_start_mark_test.py")
         Invoke-BlenderTest "Timeline Start Frame regression" (Join-Path $repoRoot "tests\blender_timeline_start_frame_test.py")
         Invoke-BlenderTest "native lifecycle regression" (Join-Path $repoRoot "tests\blender_native_lifecycle_test.py")
+        Invoke-BlenderTest "surface-object streaming regression" (Join-Path $repoRoot "tests\blender_collision_streaming_test.py")
         Invoke-BlenderTest "three-take regression" (Join-Path $repoRoot "tests\blender_three_take_regression_test.py")
         Invoke-BlenderTest "local-pose bake reconstruction regression" (Join-Path $repoRoot "tests\blender_local_pose_bake_test.py")
     }
