@@ -52,6 +52,11 @@ assert first.stats["objects_considered"] == 2
 assert first.stats["objects_rejected"] == 1
 assert first.stats["object_cache_misses"] == 1
 assert first.stats["native_surface_count"] > 0
+assert abs(first.origin[2] - -20.0) <= 0.011
+for surface in first.surface_array:
+    for native_y in (surface.v0y, surface.v1y, surface.v2y):
+        world_z = first.origin[2] + native_y / 50.0
+        assert abs(world_z) <= 0.011
 
 second = prepare()
 assert second.stats["object_cache_hits"] == 1

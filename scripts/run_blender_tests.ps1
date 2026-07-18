@@ -189,6 +189,7 @@ try {
 
     Invoke-BlenderTest "packaged add-on smoke" (Join-Path $repoRoot "tests\blender_packaged_import_test.py")
     if (-not $SmokeOnly) {
+        Invoke-BlenderTest "bulk mesh update regression" (Join-Path $repoRoot "tests\blender_mesh_update_test.py")
         Invoke-BlenderTest "live control regression" (Join-Path $repoRoot "tests\blender_live_control_test.py")
         Invoke-BlenderTest "Start Mark regression" (Join-Path $repoRoot "tests\blender_start_mark_test.py")
         Invoke-BlenderTest "Timeline Start Frame regression" (Join-Path $repoRoot "tests\blender_timeline_start_frame_test.py")

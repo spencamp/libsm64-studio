@@ -6,6 +6,7 @@ Run with:
 
 from pathlib import Path
 import ast
+import hashlib
 import importlib
 import os
 import sys
@@ -42,6 +43,10 @@ if configured_install:
     expected_package = Path(configured_install).resolve()
     assert expected_package in Path(addon.__file__).resolve().parents
     assert expected_package in Path(mario.__file__).resolve().parents
+    expected_mario = expected_package / "mario.py"
+    assert hashlib.sha256(Path(mario.__file__).read_bytes()).digest() == hashlib.sha256(
+        expected_mario.read_bytes()
+    ).digest()
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
     assert_init_import_contract(expected_package)
     cache_module = importlib.import_module("libsm64_studio.collision_cache")
@@ -87,6 +92,10 @@ else:
             assert install_root in Path(addon.__file__).resolve().parents
             assert install_root in Path(mario.__file__).resolve().parents
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
+            expected_mario = install_root / "libsm64_studio" / "mario.py"
+            assert hashlib.sha256(Path(mario.__file__).read_bytes()).digest() == hashlib.sha256(
+                expected_mario.read_bytes()
+            ).digest()
 
             # Reproduce an overlay update in one Blender process: the new package
             # initializer sees an older cached mario submodule missing its new API.

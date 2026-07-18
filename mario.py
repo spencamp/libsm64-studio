@@ -1,5 +1,4 @@
 import bpy
-import bmesh
 from array import array
 import hashlib
 import os
@@ -165,6 +164,76 @@ sm64_mario_id = -1
 mario_inputs = SM64MarioInputs()
 mario_state = SM64MarioState()
 mario_geo = SM64MarioGeometryBuffers()
+
+
+class _MeshCoordinateCache:
+    """Reusable bulk-coordinate storage without retaining a Blender RNA object."""
+
+    def __init__(self):
+        self.mesh_identity = None
+        self.vertex_count = 0
+        self.coordinates = None
+
+
+_mesh_coordinate_cache = _MeshCoordinateCache()
+
+
+def _invalidate_mesh_coordinate_cache():
+    _mesh_coordinate_cache.mesh_identity = None
+    _mesh_coordinate_cache.vertex_count = 0
+    _mesh_coordinate_cache.coordinates = None
+
+
+def _mesh_identity(mesh):
+    """Return Blender's process-lifetime ID identity without caching the ID itself."""
+    session_uid = getattr(mesh, "session_uid", None)
+    if session_uid is not None:
+        return int(session_uid)
+    return int(mesh.as_pointer())
+
+
+def _coordinate_buffer_for_mesh(mesh):
+    vertex_count = len(mesh.vertices)
+    identity = _mesh_identity(mesh)
+    cache = _mesh_coordinate_cache
+    if (
+        cache.coordinates is None
+        or cache.mesh_identity != identity
+        or cache.vertex_count != vertex_count
+    ):
+        coordinates = array('f', [0.0]) * (vertex_count * 3)
+        mesh.vertices.foreach_get("co", coordinates)
+        cache.mesh_identity = identity
+        cache.vertex_count = vertex_count
+        cache.coordinates = coordinates
+    return cache.coordinates
+
+
+def _active_mario_vertex_count(mesh):
+    active_vertex_count = int(mario_geo.numTrianglesUsed) * 3
+    vertex_count = len(mesh.vertices)
+    if active_vertex_count > vertex_count:
+        raise ValueError(
+            "Mario geometry has {} active vertices, but mesh {!r} has capacity for {}".format(
+                active_vertex_count, mesh.name, vertex_count
+            )
+        )
+    return active_vertex_count
+
+
+def _write_active_mario_coordinates(coordinates, active_vertex_count):
+    scale = SM64_SCALE_FACTOR
+    offset_x, offset_y, offset_z = origin_offset
+    positions = mario_geo.position_data
+    for vertex_index in range(active_vertex_count):
+        source_offset = vertex_index * 3
+        target_offset = vertex_index * 3
+        native_x = positions[source_offset]
+        native_y = positions[source_offset + 1]
+        native_z = positions[source_offset + 2]
+        coordinates[target_offset] = offset_x + native_x / scale
+        coordinates[target_offset + 1] = offset_y - native_z / scale
+        coordinates[target_offset + 2] = offset_z + native_y / scale
 follow_cam = False
 tick_count = 0
 last_cam_change_tick = -30
@@ -408,6 +477,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     session = _new_lifecycle()
     _lifecycle = session
     _publish_session(session)
+    _invalidate_mesh_coordinate_cache()
     _last_collision_preparation = None
 
     SM64_SCALE_FACTOR = scale
@@ -547,6 +617,7 @@ def _ensure_live_mesh_exclusive(live_object):
         if copied_keys is getattr(mesh, "shape_keys", None) or copied_keys.users != 1:
             raise RuntimeError("Could not detach Live Mario's shape keys")
         live_object.shape_key_clear()
+    _invalidate_mesh_coordinate_cache()
     return exclusive
 
 
@@ -903,6 +974,7 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
         return ()
 
     session.shutdown_in_progress = True
+    _invalidate_mesh_coordinate_cache()
     errors = []
     scene = session.scene or simulation_scene
     was_running = session.session_committed
@@ -1356,6 +1428,8 @@ def initialize_all_data(texture_buffer):
 
 def update_mesh_data(mesh: bpy.types.Mesh):
     global mario_geo
+    _invalidate_mesh_coordinate_cache()
+    _active_mario_vertex_count(mesh)
     vcol = mesh.vertex_colors.active
     for i in range(mario_geo.numTrianglesUsed):
         mesh.vertices[3*i+0].co.x = origin_offset[0] + mario_geo.position_data[9*i+0] / SM64_SCALE_FACTOR
@@ -1391,19 +1465,8 @@ def update_mesh_data(mesh: bpy.types.Mesh):
     mesh.update()
 
 def update_mesh_data_fast(mesh: bpy.types.Mesh):
-    global mario_geo, origin_offset
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bm.verts.ensure_lookup_table()
-    for i in range(mario_geo.numTrianglesUsed):
-        bm.verts[3*i+0].co.x = origin_offset[0] + mario_geo.position_data[9*i+0] / SM64_SCALE_FACTOR
-        bm.verts[3*i+0].co.z = origin_offset[2] + mario_geo.position_data[9*i+1] / SM64_SCALE_FACTOR
-        bm.verts[3*i+0].co.y = origin_offset[1] - mario_geo.position_data[9*i+2] / SM64_SCALE_FACTOR
-        bm.verts[3*i+1].co.x = origin_offset[0] + mario_geo.position_data[9*i+3] / SM64_SCALE_FACTOR
-        bm.verts[3*i+1].co.z = origin_offset[2] + mario_geo.position_data[9*i+4] / SM64_SCALE_FACTOR
-        bm.verts[3*i+1].co.y = origin_offset[1] - mario_geo.position_data[9*i+5] / SM64_SCALE_FACTOR
-        bm.verts[3*i+2].co.x = origin_offset[0] + mario_geo.position_data[9*i+6] / SM64_SCALE_FACTOR
-        bm.verts[3*i+2].co.z = origin_offset[2] + mario_geo.position_data[9*i+7] / SM64_SCALE_FACTOR
-        bm.verts[3*i+2].co.y = origin_offset[1] - mario_geo.position_data[9*i+8] / SM64_SCALE_FACTOR
-    bm.to_mesh(mesh)
-    bm.free()
+    active_vertex_count = _active_mario_vertex_count(mesh)
+    coordinates = _coordinate_buffer_for_mesh(mesh)
+    _write_active_mario_coordinates(coordinates, active_vertex_count)
+    mesh.vertices.foreach_set("co", coordinates)
+    mesh.update()

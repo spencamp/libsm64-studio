@@ -57,6 +57,43 @@ class CollisionMathTests(unittest.TestCase):
                 self.assertGreaterEqual(getattr(surface, field), collision.NATIVE_COORD_MIN)
                 self.assertLessEqual(getattr(surface, field), collision.NATIVE_COORD_MAX)
 
+    def test_vertical_origin_recenters_without_moving_world_collision(self):
+        cache = collision.CollisionCache()
+        entry = collision.ObjectEntry(
+            ("floor",), "fingerprint", ((0, 0, 0), (1, 1, 0)),
+            array('f', (0, 0, 0, 1, 0, 0, 1, 1, 0)), array('H', (0,)), 0,
+        )
+        chunk = cache._build_chunk((0, 0, 0), [entry], 100, 204.79, "fp")
+        original, _, original_origin = cache._assemble_native(
+            (chunk,), (0, 0, 0), 100, Surface
+        )
+        recentered, _, recentered_origin = cache._assemble_native(
+            (chunk,), (0, 0, 0), 100, Surface, vertical_reference=1.0
+        )
+
+        original_world_z = original_origin[2] + original[0].v0y / 100.0
+        recentered_world_z = recentered_origin[2] + recentered[0].v0y / 100.0
+        self.assertAlmostEqual(recentered_world_z, original_world_z)
+        self.assertAlmostEqual(recentered_origin[2], -9.005)
+        self.assertEqual(recentered[0].v0y, 900)
+        self.assertLess(original[0].v0y, -10000)
+
+    def test_vertical_origin_shift_is_clamped_to_native_capacity(self):
+        cache = collision.CollisionCache()
+        records = array('i', (
+            0, 0,
+            0, -32000, 0,
+            1, 32000, 0,
+            0, 0, 1,
+        ))
+        chunk = collision.ChunkEntry((0, 0, 0), "fp", records)
+        native, _, _ = cache._assemble_native(
+            (chunk,), (0, 0, 0), 1, Surface, vertical_reference=-100000
+        )
+        values = (native[0].v0y, native[0].v1y, native[0].v2y)
+        self.assertEqual(max(values), collision.NATIVE_COORD_MAX)
+        self.assertGreaterEqual(min(values), collision.NATIVE_COORD_MIN)
+
     def test_chunk_key_changes_only_with_contributors(self):
         cache = collision.CollisionCache()
         first = collision.ObjectEntry(("a",), "one", ((0, 0, 0), (1, 1, 1)), array('f'), array('H'), 0)

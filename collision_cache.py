@@ -16,6 +16,7 @@ import time
 CACHE_FORMAT_VERSION = 1
 NATIVE_COORD_MIN = -32768
 NATIVE_COORD_MAX = 32767
+NATIVE_WATER_CLEARANCE = 1000
 # Keep collision vertices away from the ABI limit so Mario's collision queries,
 # wall radius, and integer rounding cannot step outside the representable range.
 NATIVE_SAFETY_MARGIN = 2048
@@ -360,7 +361,9 @@ class CollisionCache:
                         records.extend(native)
         return ChunkEntry(coordinate, fingerprint, records)
 
-    def _assemble_native(self, chunks, center_coordinate, scale, surface_type):
+    def _assemble_native(
+        self, chunks, center_coordinate, scale, surface_type, vertical_reference=None,
+    ):
         total = sum(chunk.surface_count for chunk in chunks)
         output = (surface_type * total)()
         neighborhood_origin = chunk_center(center_coordinate, chunk_size_for_scale(scale))
@@ -389,6 +392,39 @@ class CollisionCache:
                 if any(value < NATIVE_COORD_MIN or value > NATIVE_COORD_MAX for value in values):
                     raise OverflowError("Prepared collision exceeded the shipped libsm64 int16 ABI")
                 output_index += 1
+
+        if vertical_reference is not None:
+            # The bundled libsm64 has a fixed native water plane. Centering the
+            # vertical origin on a large collision chunk can move ordinary
+            # Blender floors below that plane and put Mario into a swim action.
+            # Recenter native Y above that plane near the requested world height, while
+            # applying the inverse change to the Blender origin so every
+            # collision vertex keeps exactly the same world-space position.
+            desired_shift = round(
+                float(scale) * (neighborhood_origin[2] - float(vertical_reference))
+            ) + NATIVE_WATER_CLEARANCE
+            if total:
+                vertical_values = tuple(
+                    value
+                    for surface in output
+                    for value in (surface.v0y, surface.v1y, surface.v2y)
+                )
+                minimum_shift = NATIVE_COORD_MIN - min(vertical_values)
+                maximum_shift = NATIVE_COORD_MAX - max(vertical_values)
+                vertical_shift = max(
+                    minimum_shift, min(maximum_shift, desired_shift)
+                )
+                for surface in output:
+                    surface.v0y += vertical_shift
+                    surface.v1y += vertical_shift
+                    surface.v2y += vertical_shift
+            else:
+                vertical_shift = desired_shift
+            neighborhood_origin = (
+                neighborhood_origin[0],
+                neighborhood_origin[1],
+                neighborhood_origin[2] - vertical_shift / float(scale),
+            )
         return output, total, neighborhood_origin
 
     def prepare(self, scene, world_position, scale, surface_type, collision_types,
@@ -448,7 +484,9 @@ class CollisionCache:
 
         if status_callback:
             status_callback("Loading nearby collision…")
-        surface_array, surface_count, origin = self._assemble_native(chunks, center, scale, surface_type)
+        surface_array, surface_count, origin = self._assemble_native(
+            chunks, center, scale, surface_type, vertical_reference=world_position[2]
+        )
         stats["native_surface_count"] = surface_count
         stats["duration_seconds"] = time.perf_counter() - started
         self.last_stats = stats

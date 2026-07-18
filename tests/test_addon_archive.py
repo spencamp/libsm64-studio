@@ -45,6 +45,10 @@ class AddonArchiveTests(unittest.TestCase):
             archive_path = Path(directory) / "libsm64_studio.zip"
             build_archive(ROOT, archive_path)
             self.assert_archive_matches_package(archive_path)
+            with zipfile.ZipFile(archive_path) as archive:
+                mario_source = archive.read("libsm64_studio/mario.py").decode("utf-8")
+            self.assertIn('mesh.vertices.foreach_set("co", coordinates)', mario_source)
+            self.assertNotIn("bmesh.new()", mario_source)
 
 if __name__ == "__main__":
     unittest.main()

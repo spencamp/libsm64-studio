@@ -146,6 +146,25 @@ class PackageImportContractTests(unittest.TestCase):
         self.assertIn("bpy.app.timers.register", source)
         self.assertIn("_libsm64_generation", source)
 
+    def test_fast_mesh_update_uses_bulk_coordinates_without_bmesh(self):
+        source = (PACKAGE / "mario.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertFalse(any(
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and any(alias.name == "bmesh" for alias in node.names)
+            for node in ast.walk(tree)
+        ))
+        fast_update = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "update_mesh_data_fast"
+        )
+        calls = {
+            node.func.attr for node in ast.walk(fast_update)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("foreach_set", calls)
+        self.assertIn("update", calls)
+
 
 if __name__ == "__main__":
     unittest.main()
