@@ -15,7 +15,7 @@ if not installed_test:
     sys.path.insert(0, str(root))
 import libsm64_studio as addon
 from libsm64_studio import mario
-from libsm64_studio.recording import recorder
+from libsm64_studio.recording import PerformanceSample, recorder
 
 
 class NativeCall:
@@ -173,7 +173,13 @@ assert not recorder.active and not recorder.has_pending_samples
 assert mario.live_control_status() == mario.LIVE_IDLE
 
 # Stop & Bake and Cancel both reset when a mark exists.
-sample = array('f', [0.0] * (len(mario.get_live_mario_object().data.vertices) * 3))
+sample = PerformanceSample(
+    array('f', [0.0] * (len(mario.get_live_mario_object().data.vertices) * 3)),
+    mario.native_position_to_blender(
+        mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ
+    ),
+    float(mario.mario_state.faceAngle),
+)
 real_freeze = addon.freeze_mario_recording_for_bake
 real_bake = addon.bake_shape_keys
 real_register = addon.register_baked_take

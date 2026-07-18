@@ -122,6 +122,11 @@ assert mario.live_control_status() == mario.RECORDING
 assert session.timer_callback is timer
 timer()
 assert recorder.sample_count == 1
+same_tick_sample = recorder.samples[0]
+assert same_tick_sample.world_location == mario.native_position_to_blender(
+    mario.mario_state.posX, mario.mario_state.posY, mario.mario_state.posZ
+)
+assert same_tick_sample.face_angle == float(mario.mario_state.faceAngle)
 samples = mario.freeze_mario_recording_for_bake()
 assert len(samples) == 1 and mario.live_control_status() == mario.BAKING
 recorder.complete("Take 001")

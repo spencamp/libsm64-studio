@@ -10,6 +10,7 @@ import bpy
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
 from libsm64_studio import take_manager as takes
+from libsm64_studio import recording
 
 
 def make_bake(name):
@@ -17,12 +18,16 @@ def make_bake(name):
     mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
     obj = bpy.data.objects.new(name, mesh)
     obj["libsm64_is_bake"] = True
+    obj[recording.BAKE_SCHEMA_VERSION] = recording.CURRENT_BAKE_SCHEMA_VERSION
+    obj[recording.BAKE_LAYOUT] = recording.OBJECT_MOTION_LOCAL_POSE
     bpy.context.scene.collection.objects.link(obj)
     obj.shape_key_add(name="Basis", from_mix=False)
     obj.shape_key_add(name="Pose", from_mix=False)
     keys = obj.data.shape_keys
     keys.animation_data_create()
-    keys.animation_data.action = bpy.data.actions.new(name + " Action")
+    keys.animation_data.action = bpy.data.actions.new(name + " Pose Action")
+    obj.animation_data_create()
+    obj.animation_data.action = bpy.data.actions.new(name + " Transform Action")
     return obj
 
 

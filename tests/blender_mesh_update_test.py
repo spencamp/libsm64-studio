@@ -96,6 +96,10 @@ assert 'mesh.vertices.foreach_set("co", coordinates)' in source
 mario.SM64_SCALE_FACTOR = 2.0
 mario.origin_offset[:] = (10.0, 20.0, 30.0)
 mario._invalidate_mesh_coordinate_cache()
+assert_close(
+    mario.native_position_to_blender(2.0, 6.0, 8.0),
+    (11.0, 16.0, 33.0),
+)
 _, asymmetric_mesh = make_mesh("Asymmetric Mario", 3)
 set_native(((2.0, 6.0, 8.0), (12.0, 18.0, 24.0), (-4.0, -10.0, -14.0)))
 mario.update_mesh_data_fast(asymmetric_mesh)
@@ -230,8 +234,13 @@ recorder.cancel()
 recorder.start(1.0, 30.0)
 set_native(((300.0, 400.0, 500.0), (350.0, 450.0, 550.0), (400.0, 500.0, 600.0)))
 mario.update_mesh_data_fast(mesh)
-assert recorder.capture_mesh(mesh, 1)
-assert_close(recorder.samples[-1], flat_coordinates(mesh))
+recorded_location = mario.native_position_to_blender(125.0, -75.0, 225.0)
+recorded_face_angle = -1.375
+assert recorder.capture_mesh(mesh, 1, recorded_location, recorded_face_angle)
+recorded_sample = recorder.samples[-1]
+assert_close(recorded_sample.coordinates, flat_coordinates(mesh))
+assert_close(recorded_sample.world_location, recorded_location)
+assert recorded_sample.face_angle == recorded_face_angle
 recorder.cancel()
 
 # A full UV/color update invalidates the buffer. The next fast call seeds a new

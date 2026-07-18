@@ -199,6 +199,7 @@ try {
         Invoke-BlenderTest "Timeline Start Frame regression" (Join-Path $repoRoot "tests\blender_timeline_start_frame_test.py")
         Invoke-BlenderTest "native lifecycle regression" (Join-Path $repoRoot "tests\blender_native_lifecycle_test.py")
         Invoke-BlenderTest "three-take regression" (Join-Path $repoRoot "tests\blender_three_take_regression_test.py")
+        Invoke-BlenderTest "local-pose bake reconstruction regression" (Join-Path $repoRoot "tests\blender_local_pose_bake_test.py")
     }
 
     Write-Host ""

@@ -635,7 +635,7 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_stop_and_bake"
     bl_label = "Stop & Bake"
     bl_description = (
-        "Stop recording and bake positions to shape keys; dynamic UV and color changes are not captured"
+        "Stop recording and bake Mario's path/facing to object transforms and body pose to local shape keys; dynamic UV and color changes are not captured"
     )
 
     def execute(self, context):

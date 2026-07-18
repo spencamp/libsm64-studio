@@ -14,6 +14,7 @@ if os.environ.get("LIBSM64_TEST_INSTALLED") != "1":
     sys.path.insert(0, str(root))
 import libsm64_studio as addon
 from libsm64_studio import mario
+from libsm64_studio.recording import PerformanceSample
 
 
 class Reporter:
@@ -72,13 +73,14 @@ real_register = addon.register_baked_take
 real_select = addon.select_take
 real_return = addon.return_to_start_mark_after_transition
 transitions = []
+sample = PerformanceSample((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0)
 try:
-    addon.freeze_mario_recording_for_bake = lambda: (object(),)
+    addon.freeze_mario_recording_for_bake = lambda: (sample,)
     addon.bake_shape_keys = lambda *_args: SimpleNamespace(name="Baked")
     addon.register_baked_take = lambda _scene, _obj: 1
     addon.select_take = lambda *_args: None
     addon.return_to_start_mark_after_transition = lambda: transitions.append("resume")
-    addon.recorder.samples = [object()]
+    addon.recorder.samples = [sample]
     addon.recorder.start_frame = 120.0
     addon.recorder.target_fps = 30.0
     scene.frame_set(444)

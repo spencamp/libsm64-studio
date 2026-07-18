@@ -214,19 +214,28 @@ def _active_mario_vertex_count(mesh):
     return active_vertex_count
 
 
+def native_position_to_blender(native_x, native_y, native_z):
+    """Convert one libsm64 XYZ position to Blender world XYZ coordinates."""
+    return (
+        origin_offset[0] + float(native_x) / SM64_SCALE_FACTOR,
+        origin_offset[1] - float(native_z) / SM64_SCALE_FACTOR,
+        origin_offset[2] + float(native_y) / SM64_SCALE_FACTOR,
+    )
+
+
 def _write_active_mario_coordinates(coordinates, active_vertex_count):
-    scale = SM64_SCALE_FACTOR
-    offset_x, offset_y, offset_z = origin_offset
     positions = mario_geo.position_data
     for vertex_index in range(active_vertex_count):
         source_offset = vertex_index * 3
         target_offset = vertex_index * 3
-        native_x = positions[source_offset]
-        native_y = positions[source_offset + 1]
-        native_z = positions[source_offset + 2]
-        coordinates[target_offset] = offset_x + native_x / scale
-        coordinates[target_offset + 1] = offset_y - native_z / scale
-        coordinates[target_offset + 2] = offset_z + native_y / scale
+        blender_position = native_position_to_blender(
+            positions[source_offset],
+            positions[source_offset + 1],
+            positions[source_offset + 2],
+        )
+        coordinates[target_offset] = blender_position[0]
+        coordinates[target_offset + 1] = blender_position[1]
+        coordinates[target_offset + 2] = blender_position[2]
 follow_cam = False
 tick_count = 0
 last_cam_change_tick = -30
@@ -1076,12 +1085,15 @@ def tick_mario(scene, depsgraph=None, _session=None):
     session.library.sm64_mario_tick(
         session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
     )
+    mario_world_location = native_position_to_blender(
+        mario_state.posX, mario_state.posY, mario_state.posZ
+    )
 
     if follow_cam:
         scene.cursor.location = (
-            origin_offset[0] + mario_state.posX / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.x,
-            origin_offset[1] - mario_state.posZ / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.y,
-            origin_offset[2] + mario_state.posY / SM64_SCALE_FACTOR + scene.libsm64.camera_shift.z
+            mario_world_location[0] + scene.libsm64.camera_shift.x,
+            mario_world_location[1] + scene.libsm64.camera_shift.y,
+            mario_world_location[2] + scene.libsm64.camera_shift.z,
         )
 
         if view3d is not None:
@@ -1096,7 +1108,12 @@ def tick_mario(scene, depsgraph=None, _session=None):
         update_mesh_data_fast(live_mesh)
 
     try:
-        recorder.capture_mesh(live_mesh, tick_count)
+        recorder.capture_mesh(
+            live_mesh,
+            tick_count,
+            mario_world_location,
+            float(mario_state.faceAngle),
+        )
     except Exception as exc:
         recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
         if session.control_state == RECORDING:
@@ -1317,15 +1334,13 @@ def update_mesh_data(mesh: bpy.types.Mesh):
     _active_mario_vertex_count(mesh)
     vcol = mesh.vertex_colors.active
     for i in range(mario_geo.numTrianglesUsed):
-        mesh.vertices[3*i+0].co.x = origin_offset[0] + mario_geo.position_data[9*i+0] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+0].co.z = origin_offset[2] + mario_geo.position_data[9*i+1] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+0].co.y = origin_offset[1] - mario_geo.position_data[9*i+2] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+1].co.x = origin_offset[0] + mario_geo.position_data[9*i+3] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+1].co.z = origin_offset[2] + mario_geo.position_data[9*i+4] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+1].co.y = origin_offset[1] - mario_geo.position_data[9*i+5] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+2].co.x = origin_offset[0] + mario_geo.position_data[9*i+6] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+2].co.z = origin_offset[2] + mario_geo.position_data[9*i+7] / SM64_SCALE_FACTOR
-        mesh.vertices[3*i+2].co.y = origin_offset[1] - mario_geo.position_data[9*i+8] / SM64_SCALE_FACTOR
+        for corner in range(3):
+            position_offset = 9 * i + 3 * corner
+            mesh.vertices[3 * i + corner].co = native_position_to_blender(
+                mario_geo.position_data[position_offset],
+                mario_geo.position_data[position_offset + 1],
+                mario_geo.position_data[position_offset + 2],
+            )
         mesh.uv_layers.active.data[mesh.loops[3*i+0].index].uv = (mario_geo.uv_data[6*i+0], mario_geo.uv_data[6*i+1])
         mesh.uv_layers.active.data[mesh.loops[3*i+1].index].uv = (mario_geo.uv_data[6*i+2], mario_geo.uv_data[6*i+3])
         mesh.uv_layers.active.data[mesh.loops[3*i+2].index].uv = (mario_geo.uv_data[6*i+4], mario_geo.uv_data[6*i+5])

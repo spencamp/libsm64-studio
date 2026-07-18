@@ -23,8 +23,12 @@ mesh.from_pydata(
 source = bpy.data.objects.new("LibSM64 Mario", mesh)
 bpy.context.scene.collection.objects.link(source)
 
-sample_a = array('f', [0, 0, 0, 1, 0, 0, 0, 1, 0])
-sample_b = array('f', [0, 0, 1, 1, 0, 1, 0, 1, 1])
+sample_a = recording.PerformanceSample(
+    array('f', [0, 0, 0, 1, 0, 0, 0, 1, 0]), (0, 0, 0), 0
+)
+sample_b = recording.PerformanceSample(
+    array('f', [0, 0, 1, 1, 0, 1, 0, 1, 1]), (0, 0, 0), 0
+)
 bpy.context.scene.render.fps = 24
 bpy.context.scene.frame_end = 1
 
@@ -38,6 +42,8 @@ assert bake["libsm64_sample_count"] == 2
 assert bake["libsm64_target_fps"] == 24.0
 assert bake["libsm64_is_bake"] is True
 assert bake.data.shape_keys.animation_data.action is not None
+assert bake.animation_data.action is not None
+assert bake.animation_data.action is not bake.data.shape_keys.animation_data.action
 curves = list(recording.iter_action_fcurves(bake.data.shape_keys.animation_data.action))
 assert len(curves) == 2
 assert all(
@@ -58,12 +64,14 @@ assert bake.data.shape_keys.key_blocks[2].value == 1.0
 
 first_mesh = bake.data
 first_action = bake.data.shape_keys.animation_data.action
+first_transform_action = bake.animation_data.action
 second = recording.bake_shape_keys(
     bpy.context, source, (sample_b,), start_frame=20, target_fps=24
 )
 assert second is not bake
 assert second.data is not first_mesh
 assert second.data.shape_keys.animation_data.action is not first_action
+assert second.animation_data.action is not first_transform_action
 assert len(first_mesh.shape_keys.key_blocks) == 3
 
 # Load the repository as an add-on package and verify registration plus handler
@@ -107,7 +115,8 @@ addon.take_manager.unfavorite_take(bpy.context.scene, second)
 addon.take_manager.reject_take(bpy.context.scene, second)
 rejected_object_name = second.name
 rejected_mesh_name = second.data.name
-rejected_action_name = second.data.shape_keys.animation_data.action.name
+rejected_pose_action_name = second.data.shape_keys.animation_data.action.name
+rejected_transform_action_name = second.animation_data.action.name
 
 
 def unrelated_handler(scene, depsgraph=None):
@@ -124,7 +133,8 @@ assert unrelated_handler in handlers
 assert addon.take_manager.cleanup_rejected(bpy.context.scene) == 1
 assert bpy.data.objects.get(rejected_object_name) is None
 assert bpy.data.meshes.get(rejected_mesh_name) is None
-assert bpy.data.actions.get(rejected_action_name) is None
+assert bpy.data.actions.get(rejected_pose_action_name) is None
+assert bpy.data.actions.get(rejected_transform_action_name) is None
 assert bpy.data.objects.get(bake.name) is bake
 
 # Exercise actual Blender action creation at the other common output rates;

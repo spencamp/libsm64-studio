@@ -108,17 +108,32 @@ stored in the `.blend` as stable metadata, so object renaming and reordering do
 not break the take manager. The inline capture confirmation disappears after
 about two seconds and does not require dismissing a dialog.
 
-The bake has one shape key per 30 Hz libsm64 sample and uses constant
-interpolation. Samples are placed at fractional frames when necessary, preserving
-the take's real-time duration at 24, 30, 60, or other target frame rates. Each
-take owns its mesh, shape-key datablock, and action, so later takes do not modify
-earlier ones. The baked object can be saved and reopened without libsm64, the ROM,
-a controller, or a frame-change handler.
+Each new bake separates global motion from body deformation. The baked object's
+location contains Mario's world-space path, its Z rotation contains Mario's
+facing, and its shape keys contain only Mario-local body poses. Location,
+rotation, and pose are keyed together for every 30 Hz libsm64 sample and use
+constant interpolation, so initial playback holds the same captured poses at the
+original sample cadence. Samples are placed at fractional frames when necessary,
+preserving the take's real-time duration at 24, 30, 60, or other target frame
+rates.
+
+You can edit the object's location curves to reposition its route or its Z
+rotation curve to redirect the take without changing the recorded local body
+deformation. Changing transform or pose interpolation away from constant is an
+intentional animation edit and may change the frame-for-frame captured
+appearance. Each new take exclusively owns its mesh, shape-key datablock, pose
+action, and object-transform action, so later takes do not modify earlier ones.
+The baked object can be saved and reopened without libsm64, the ROM, a
+controller, or a frame-change handler. Existing `.blend` files with legacy
+world-space, shape-key-only takes remain supported; their position or facing is
+not inferred or converted.
 
 This MVP is intended for short cinematic takes. A four-second take creates about
 120 shape keys, and the panel warns at 300 samples (about ten seconds); there is
-no hard sample limit. It records vertex positions only. The copied mesh preserves
-the current material, texture image, UV layer, and vertex colors, but later
+no hard sample limit. It records object translation, Z-facing rotation, and
+vertex body poses; it does not create an armature or skeletal animation. The
+copied mesh preserves the current material, texture image, UV layer, and vertex
+colors, but later
 blinking/facial UV changes, changing vertex colors, simulation, and collision are
 not part of baked playback. Blender calculates displayed normals from the
 deformed geometry.
@@ -192,7 +207,7 @@ and 60):
 11. Render frames in Eevee and Cycles.
 12. Save the `.blend`, close Blender, disconnect the controller or make the ROM
    unavailable, reopen the file, and verify the bake still scrubs and renders.
-13. Verify `Take 001` is hidden while its mesh and action remain unchanged after
+13. Verify `Take 001` is hidden while its mesh and two actions remain unchanged after
    the later regular take becomes current.
 14. Install a temporary unrelated `frame_change_pre` handler, run and stop another
    simulation, and verify that handler remains installed.
@@ -227,7 +242,7 @@ single packed image from the ROM; it does not create a texture per take.
 
 - Direct a playable Live Mario in any collision-ready Blender scene.
 - Rehearse, mark a spatial start and timeline start, record, and bake short
-  performances into self-contained shape-key takes.
+  performances into self-contained object-motion and local-shape-key takes.
 - Review, favorite, reject, restore, and retain multiple takes in the `.blend`.
 - Render and reopen baked performances without libsm64, a ROM, or a controller.
 - Use Fast64 terrain and collision metadata when it is present in a scene.

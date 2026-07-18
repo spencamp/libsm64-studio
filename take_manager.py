@@ -10,7 +10,7 @@ TAKE_OWNER = "libsm64_take_owner"
 SCENE_CURRENT_TAKE = "libsm64_current_take_id"
 SCENE_NEXT_TAKE = "libsm64_next_take_number"
 SCENE_SCHEMA_VERSION = "libsm64_take_schema_version"
-TAKE_SCHEMA_VERSION = 1
+TAKE_SCHEMA_VERSION = 2
 
 REGULAR = "REGULAR"
 FAVORITE = "FAVORITE"
@@ -96,15 +96,29 @@ def reconcile_scene(scene, select_fallback=True, exclude=None):
             next_number += 1
         take_id = obj[TAKE_ID]
         mesh = getattr(obj, "data", None)
-        if mesh is not None and mesh.users == 1 and not mesh.get(TAKE_OWNER):
-            mesh[TAKE_OWNER] = take_id
+        if mesh is not None and mesh.users == 1:
+            if not mesh.get(TAKE_OWNER):
+                mesh[TAKE_OWNER] = take_id
             key_data = getattr(mesh, "shape_keys", None)
-            if key_data is not None and not key_data.get(TAKE_OWNER):
-                key_data[TAKE_OWNER] = take_id
-                animation_data = getattr(key_data, "animation_data", None)
-                action = getattr(animation_data, "action", None)
-                if action is not None and action.users == 1 and not action.get(TAKE_OWNER):
-                    action[TAKE_OWNER] = take_id
+            if key_data is not None and key_data.users == 1:
+                if not key_data.get(TAKE_OWNER):
+                    key_data[TAKE_OWNER] = take_id
+                pose_animation = getattr(key_data, "animation_data", None)
+                pose_action = getattr(pose_animation, "action", None)
+                if (
+                    pose_action is not None
+                    and pose_action.users == 1
+                    and not pose_action.get(TAKE_OWNER)
+                ):
+                    pose_action[TAKE_OWNER] = take_id
+            object_animation = getattr(obj, "animation_data", None)
+            transform_action = getattr(object_animation, "action", None)
+            if (
+                transform_action is not None
+                and transform_action.users == 1
+                and not transform_action.get(TAKE_OWNER)
+            ):
+                transform_action[TAKE_OWNER] = take_id
 
     scene[SCENE_NEXT_TAKE] = max(
         next_number,
@@ -133,6 +147,18 @@ def _mark_owned(datablock, take_id):
         datablock[TAKE_OWNER] = take_id
 
 
+def _property_snapshot(owner, key):
+    return key in owner, owner.get(key)
+
+
+def _restore_property(owner, key, snapshot):
+    existed, value = snapshot
+    if existed:
+        owner[key] = value
+    elif key in owner:
+        del owner[key]
+
+
 def register_baked_take(scene, obj):
     """Commit one already-built take without rewriting any earlier take."""
     mesh = getattr(obj, "data", None)
@@ -149,7 +175,9 @@ def register_baked_take(scene, obj):
         return number
 
     from .recording import validate_take_ownership
-    validate_take_ownership(obj)
+    mesh, key_data, pose_action, transform_action = validate_take_ownership(
+        obj, require_schema_2=True
+    )
     existing_numbers = [int(take.get(TAKE_NUMBER, 0)) for take in iter_takes() if take is not obj]
     number = max(
         1,
@@ -157,17 +185,26 @@ def register_baked_take(scene, obj):
         max(existing_numbers, default=0) + 1,
     )
     take_id = uuid.uuid4().hex
-    key_data = getattr(mesh, "shape_keys", None)
-    animation_data = getattr(key_data, "animation_data", None)
-    action = getattr(animation_data, "action", None)
     prior_scene = {
-        SCENE_CURRENT_TAKE: scene.get(SCENE_CURRENT_TAKE),
-        SCENE_NEXT_TAKE: scene.get(SCENE_NEXT_TAKE),
+        key: _property_snapshot(scene, key)
+        for key in (SCENE_CURRENT_TAKE, SCENE_NEXT_TAKE, SCENE_SCHEMA_VERSION)
     }
     prior_visibility = [
         (take, take.hide_render, take.hide_get()) for take in iter_takes() if take is not obj
     ]
-    prior_names = (obj.name, mesh.name, key_data.name, action.name)
+    prior_candidate_visibility = (obj.hide_render, obj.hide_get())
+    prior_names = (
+        obj.name, mesh.name, key_data.name, transform_action.name, pose_action.name
+    )
+    object_property_keys = (TAKE_ID, TAKE_NUMBER, TAKE_DISPOSITION)
+    prior_object_properties = {
+        key: _property_snapshot(obj, key) for key in object_property_keys
+    }
+    owned_datablocks = (mesh, key_data, pose_action, transform_action)
+    prior_owners = [
+        (datablock, _property_snapshot(datablock, TAKE_OWNER))
+        for datablock in owned_datablocks
+    ]
     try:
         obj[TAKE_ID] = take_id
         obj[TAKE_NUMBER] = number
@@ -175,36 +212,45 @@ def register_baked_take(scene, obj):
         obj.name = "LibSM64 Studio Take {:03d}".format(number)
         mesh.name = "LibSM64 Studio Take {:03d} Mesh".format(number)
         key_data.name = "LibSM64 Studio Take {:03d} Shape Keys".format(number)
-        action.name = "LibSM64 Studio Take {:03d} Action".format(number)
-        for datablock in (mesh, key_data, action):
+        transform_action.name = "LibSM64 Studio Take {:03d} Transform Action".format(number)
+        pose_action.name = "LibSM64 Studio Take {:03d} Pose Action".format(number)
+        for datablock in owned_datablocks:
             _mark_owned(datablock, take_id)
 
         # Ownership and metadata are complete before any earlier take is hidden.
-        validate_take_ownership(obj)
+        validate_take_ownership(obj, require_schema_2=True)
+        if any(datablock.get(TAKE_OWNER) != take_id for datablock in owned_datablocks):
+            raise TakeError("The new take ownership transaction did not commit all datablocks")
         scene[SCENE_NEXT_TAKE] = number + 1
         scene[SCENE_CURRENT_TAKE] = take_id
+        scene[SCENE_SCHEMA_VERSION] = TAKE_SCHEMA_VERSION
         apply_visibility(scene)
         return number
     except Exception:
-        for key in (TAKE_ID, TAKE_NUMBER, TAKE_DISPOSITION):
-            if key in obj:
-                del obj[key]
-        for datablock in (mesh, key_data, action):
-            if TAKE_OWNER in datablock:
-                del datablock[TAKE_OWNER]
-        obj.name, mesh.name, key_data.name, action.name = prior_names
-        for key, value in prior_scene.items():
-            if value is None:
-                if key in scene:
-                    del scene[key]
-            else:
-                scene[key] = value
+        for key, snapshot in prior_object_properties.items():
+            _restore_property(obj, key, snapshot)
+        for datablock, snapshot in prior_owners:
+            _restore_property(datablock, TAKE_OWNER, snapshot)
+        (
+            obj.name,
+            mesh.name,
+            key_data.name,
+            transform_action.name,
+            pose_action.name,
+        ) = prior_names
+        for key, snapshot in prior_scene.items():
+            _restore_property(scene, key, snapshot)
         for take, hide_render, hidden in prior_visibility:
             take.hide_render = hide_render
             try:
                 take.hide_set(hidden)
             except (AttributeError, RuntimeError):
                 take.hide_viewport = hidden
+        obj.hide_render = prior_candidate_visibility[0]
+        try:
+            obj.hide_set(prior_candidate_visibility[1])
+        except (AttributeError, RuntimeError):
+            obj.hide_viewport = prior_candidate_visibility[1]
         raise
 
 
@@ -264,15 +310,22 @@ def cleanup_rejected(scene=None):
         take_id = obj.get(TAKE_ID)
         mesh = getattr(obj, "data", None)
         key_data = getattr(mesh, "shape_keys", None) if mesh is not None else None
-        animation_data = getattr(key_data, "animation_data", None)
-        action = getattr(animation_data, "action", None)
+        pose_animation = getattr(key_data, "animation_data", None)
+        pose_action = getattr(pose_animation, "action", None)
+        object_animation = getattr(obj, "animation_data", None)
+        transform_action = getattr(object_animation, "action", None)
         bpy.data.objects.remove(obj, do_unlink=True)
         if mesh is not None and mesh.get(TAKE_OWNER) == take_id and mesh.users == 0:
             bpy.data.meshes.remove(mesh)
         # Removing an exclusively owned mesh also removes its shape-key
         # datablock. Shared/duplicated meshes are deliberately left intact.
-        if action is not None and action.get(TAKE_OWNER) == take_id and action.users == 0:
-            bpy.data.actions.remove(action)
+        actions = []
+        for action in (pose_action, transform_action):
+            if action is not None and all(action is not existing for existing in actions):
+                actions.append(action)
+        for action in actions:
+            if action.get(TAKE_OWNER) == take_id and action.users == 0:
+                bpy.data.actions.remove(action)
         removed += 1
     if scene is not None:
         current_take(scene)
