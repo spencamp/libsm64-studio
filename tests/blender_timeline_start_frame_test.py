@@ -1,6 +1,7 @@
 """Blender regression for the persistent, independent timeline start frame."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import os
 import sys
 import tempfile
@@ -62,6 +63,45 @@ finally:
     addon.is_mario_running = real_is_mario_running
     addon.begin_mario_recording = real_begin_mario_recording
 assert begin_calls == [(120, False)]
+
+# Successful bake and cancel transitions recall the frame automatically, while
+# leaving the setting independent from take registration and selection.
+real_freeze = addon.freeze_mario_recording_for_bake
+real_bake = addon.bake_shape_keys
+real_register = addon.register_baked_take
+real_select = addon.select_take
+real_return = addon.return_to_start_mark_after_transition
+transitions = []
+try:
+    addon.freeze_mario_recording_for_bake = lambda: (object(),)
+    addon.bake_shape_keys = lambda *_args: SimpleNamespace(name="Baked")
+    addon.register_baked_take = lambda _scene, _obj: 1
+    addon.select_take = lambda *_args: None
+    addon.return_to_start_mark_after_transition = lambda: transitions.append("resume")
+    addon.recorder.samples = [object()]
+    addon.recorder.start_frame = 120.0
+    addon.recorder.target_fps = 30.0
+    scene.frame_set(444)
+    assert addon.StopAndBake_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
+    assert scene.frame_current == 120
+    assert transitions == ["resume"]
+
+    scene.frame_set(555)
+    assert addon.CancelRecording_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
+    assert scene.frame_current == 120
+    assert transitions == ["resume", "resume"]
+
+    settings.start_recording_from_saved_frame = False
+    scene.frame_set(666)
+    assert addon.CancelRecording_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
+    assert scene.frame_current == 666
+finally:
+    addon.freeze_mario_recording_for_bake = real_freeze
+    addon.bake_shape_keys = real_bake
+    addon.register_baked_take = real_register
+    addon.select_take = real_select
+    addon.return_to_start_mark_after_transition = real_return
+    settings.start_recording_from_saved_frame = True
 
 # Both the value and its explicit set state survive a .blend save/reopen.
 with tempfile.TemporaryDirectory(prefix="libsm64-timeline-") as temporary:

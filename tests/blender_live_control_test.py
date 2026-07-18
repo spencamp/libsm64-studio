@@ -127,7 +127,7 @@ assert len(samples) == 1 and mario.live_control_status() == mario.BAKING
 recorder.complete("Take 001")
 mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
-assert session.timer_callback is timer and not bpy.app.timers.is_registered(timer)
+assert session.timer_callback is timer and bpy.app.timers.is_registered(timer)
 assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
 assert all(not value for value in addon.input_value.values())
 assert scene.render.fps == 24 and math.isclose(scene.render.fps_base, 1.001, rel_tol=1e-6)
@@ -143,6 +143,7 @@ assert recorder.sample_count == 1
 recorder.cancel()
 mario.return_to_start_mark_after_transition()
 assert mario.live_control_status() == mario.LIVE_IDLE
+assert bpy.app.timers.is_registered(timer)
 assert first.sm64_mario_create.calls[-1] == (123, 456, -79)
 
 # A failed bake can retain samples while live control safely returns to idle.
@@ -155,6 +156,7 @@ assert recorder.has_pending_samples
 assert mario.live_control_status() == mario.LIVE_IDLE
 recorder.cancel()
 mario.return_to_start_mark_after_transition()
+assert bpy.app.timers.is_registered(timer)
 
 # Keyboard latches are usable while idle and cleared by a reset.
 addon.config["keyboard_control"] = True

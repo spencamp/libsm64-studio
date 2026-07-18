@@ -879,7 +879,7 @@ def resume_live_idle_after_transition(mark):
 
 
 def return_to_start_mark_after_transition():
-    """Return to a valid Start Mark, then pause Live Mario for review."""
+    """Return to a valid Start Mark and resume controllable idle operation."""
     session = _lifecycle
     valid_mark = has_valid_start_mark()
     if recorder.active:
@@ -891,7 +891,7 @@ def return_to_start_mark_after_transition():
     else:
         abandon_bake_transition()
         mark = None
-    pause_mario_for_review()
+    resume_mario_for_recording()
     return mark
 
 

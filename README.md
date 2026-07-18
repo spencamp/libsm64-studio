@@ -68,7 +68,7 @@ Mario and any number of baked takes:
    movement state cleared.
 3. Move the timeline to the desired output start frame and click **Set Start
    Frame**. Enable **Start recording from saved frame** to return to this frame
-   automatically before each new capture. **Go to Start Frame** recalls it
+   automatically before each new capture and after each bake or cancel. **Go to Start Frame** recalls it
    manually. The Timeline Start Frame is stored in the `.blend` and remains
    independent of Mario's spatial Start Mark.
 4. Click **Start Recording**. Recording does not move Mario or replace the Mario
@@ -78,11 +78,11 @@ Mario and any number of baked takes:
    simulation at the mark before capture begins. This option is unavailable
    until the active Live Mario session has a valid mark.
 6. Perform the take, then click **Stop & Bake**. Live Mario returns to the
-   persistent Start Mark when one exists and pauses for review; without a mark,
-   baking still succeeds and Live Mario pauses in place.
+   persistent Start Mark when one exists and immediately resumes live control;
+   without a mark, baking still succeeds and control continues in place.
 7. Scrub or play the result with Blender's normal timeline controls, favorite or
-   reject it, click **Reset to Mark** to rehearse, or click **Start Recording**
-   for another take without reinserting Mario.
+   reject it, keep rehearsing immediately, or click **Start Recording** for
+   another take without reinserting Mario.
 
 Live simulation runs from one add-on-owned Blender timer at approximately 30 Hz.
 It is independent of timeline playback and never changes the scene's render FPS
@@ -124,11 +124,10 @@ not part of baked playback. Blender calculates displayed normals from the
 deformed geometry.
 
 Use **Cancel Recording** to discard a pending take and return Live Mario to the
-persistent Start Mark when one exists, without creating a take. Stop, cancel,
-and repeated recordings never replace the mark. **End Studio Session** clears it,
-and a mark from an older native lifecycle generation is never reused.
-Live Mario pauses for review; **Reset to Mark** leaves it controllable, and the
-next **Start Recording** resumes simulation before capture.
+persistent Start Mark when one exists, without creating a take. Live control
+resumes immediately after both bake and cancel. Stop, cancel, and repeated
+recordings never replace the mark. **End Studio Session** clears it, and a mark
+from an older native lifecycle generation is never reused.
 Live Mario remains visible during control; baked-take visibility continues to
 follow the current/favorite/regular/rejected rules independently. If the two
 overlap after a reset, move Live Mario to continue rehearsing or hide it manually.
@@ -180,14 +179,14 @@ and 60):
    start recording and confirm capture begins from the saved mark. Perform for
    approximately four seconds.
 6. Click **Stop & Bake** and confirm `Take 001` is selected and visible, Live
-   Mario returns to the persistent Start Mark and pauses for review, while the
-   scene stays at 24 FPS with its original FPS base.
+   Mario returns to the persistent Start Mark and remains controllable, while
+   the scene stays at 24 FPS with its original FPS base.
 7. Scrub from the recording start frame through the take. Confirm poses are held,
    do not blend, and the duration is about four seconds.
 8. Complete several more takes and confirm the Start Mark is never replaced.
    Set a new mark, reset, and confirm the replacement position is used.
 9. Start another take, cancel it, and confirm Live Mario returns to the persistent
-   Start Mark and pauses for review. Click **Reset to Mark** and confirm control resumes.
+   Start Mark and remains controllable without an intermediate action.
 10. Play and scrub baked takes at 24 FPS while confirming Live Mario's timer does
    not force timeline playback or move the current frame on its own.
 11. Render frames in Eevee and Cycles.

@@ -245,7 +245,7 @@ class LibSm64Properties(bpy.types.PropertyGroup):
     )
     start_recording_from_saved_frame : bpy.props.BoolProperty(
         name="Start recording from saved frame",
-        description="Move to the saved Timeline Start Frame before capture begins",
+        description="Return to the saved Timeline Start Frame when a recording starts or finishes",
         default=False,
     )
 
@@ -492,6 +492,19 @@ class ControlMario_OT_Operator(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+def _restore_timeline_start_frame(scene):
+    """Recall the saved take frame when the scene's automatic option is enabled."""
+    settings = getattr(scene, "libsm64", None)
+    if not (
+        settings is not None
+        and settings.start_recording_from_saved_frame
+        and settings.timeline_start_frame_set
+    ):
+        return False
+    scene.frame_set(int(settings.timeline_start_frame))
+    return True
+
+
 class StartRecording_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_start_recording"
     bl_label = "Start Recording"
@@ -509,12 +522,7 @@ class StartRecording_OT_Operator(bpy.types.Operator):
             and has_valid_start_mark()
         )
         try:
-            if (
-                settings is not None
-                and settings.start_recording_from_saved_frame
-                and settings.timeline_start_frame_set
-            ):
-                context.scene.frame_set(int(settings.timeline_start_frame))
+            _restore_timeline_start_frame(context.scene)
             begin_mario_recording(context.scene, reset_to_mark=auto_reset)
         except Exception as exc:
             abandon_bake_transition()
@@ -676,6 +684,14 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
                 "{} was captured, but reset to Start Mark failed: {}".format(label, exc),
             )
             return {'FINISHED'}
+        try:
+            _restore_timeline_start_frame(context.scene)
+        except Exception as exc:
+            self.report(
+                {'ERROR'},
+                "{} was captured, but Timeline Start Frame restore failed: {}".format(label, exc),
+            )
+            return {'FINISHED'}
         _show_confirmation("âœ“ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
@@ -696,6 +712,11 @@ class CancelRecording_OT_Operator(bpy.types.Operator):
         except Exception as exc:
             abandon_bake_transition()
             self.report({'ERROR'}, "Recording discarded, but reset to Start Mark failed: {}".format(exc))
+            return {'FINISHED'}
+        try:
+            _restore_timeline_start_frame(context.scene)
+        except Exception as exc:
+            self.report({'ERROR'}, "Recording discarded, but Timeline Start Frame restore failed: {}".format(exc))
             return {'FINISHED'}
         self.report({'INFO'}, "Mario recording discarded")
         return {'FINISHED'}
