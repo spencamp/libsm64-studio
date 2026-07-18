@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.4.0+timeline-start"
+    assert addon.BUILD_ID == "2.5.0+chunked-collision"
 
 
 class NativeCall:

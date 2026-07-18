@@ -31,6 +31,12 @@ Extensions → ▾ → Install from Disk** in newer Blender releases), select th
 then search for **LibSM64 Studio** and enable it. If it does not appear, enable
 **Auto Run Python Scripts** in Preferences.
 
+When upgrading an existing development build, disable the add-on, close Blender,
+delete the existing `libsm64_studio` add-on directory, and then install the new
+ZIP. Blender may overlay same-name add-ons without removing obsolete modules or
+bytecode, which can create a mixed-file installation. The add-on now detects that
+state and asks for a clean reinstall.
+
 ## Start a studio session
 
 Before opening Blender, connect an XInput controller to perform with one;
@@ -41,6 +47,40 @@ keyboard control is also available. In the 3D Viewport sidebar (`N`), open the
 cleanup.
 
 *Note:* The SM64 US ROM must be the one with the SHA1 checksum of `9bef1128717f958171a4afac3ed78ee2bb4e86ce`.
+
+### Automatic collision regions
+
+**Start Live Mario** now prepares only collision near the 3D cursor. No collision
+collections, object tags, proxy meshes, or manual chunk assignment are required.
+Evaluated mesh geometry is cached in memory, automatically clipped into spatial
+chunks, and reused as Mario travels. Moving a small safety distance into a
+neighboring chunk briefly pauses the simulation, deletes the native Mario
+instance, loads the next 3×3×3 collision
+neighborhood, and recreates Mario at the same world position. Momentum and the
+current animation reset during this safe transition. The bundled 2022 native
+library does not export a facing-angle setter, so facing is saved and restored
+when a compatible native build provides that setter; with the bundled binaries,
+facing also resets during a region switch.
+
+The shipped native surface ABI stores coordinates as signed 16-bit integers
+(`-32768` through `32767`). The chunk edge is derived rather than hard-coded:
+`floor((32767 - 2048 safety reserve) / 1.5) / Blender-to-SM64 scale`. The `1.5`
+factor is the furthest edge of a radius-one neighborhood from its center. At the
+default scale of 100 this produces chunks about 204.79 Blender units wide, with
+one complete neighboring chunk loaded in every direction before a switch.
+
+Collision caches last for the current Blender process only. Geometry, evaluated
+modifier output, transforms, parent transforms, Fast64 material/terrain metadata,
+visibility, scale, and cache-format changes are included in invalidation. Use
+**Clear Collision Cache** in the sidebar to discard all cached entries manually.
+The console and sidebar report preparation/loading status, cache hits and misses,
+triangle rebuild counts, native surface counts, and elapsed time.
+
+Region switching is intentionally blocked while recording because recreating
+Mario would introduce a discontinuity in the take. At the boundary Mario stops
+inside the still-loaded neighboring region and the sidebar displays:
+`Collision region boundary reached. Stop recording to load the next area.` After
+recording is stopped or frozen for baking, the next region can load safely.
 
 ## Capture a Mario performance
 
@@ -192,6 +232,28 @@ and 60):
 17. Repeat the rehearsal, record, bake, cancel, review, and shutdown checks at
     30 and 60 FPS. Confirm native Mario delete/global terminate occur once at
     **End Studio Session** and no owned timer remains.
+
+### Manual collision streaming checklist
+
+1. Start in a normal small scene and confirm only the nearby neighborhood loads.
+2. Open a downloaded scene with thousands of separate mesh objects; confirm the
+   bounds-rejection and preparation diagnostics appear and Mario starts nearby.
+3. Test one very large joined mesh spanning multiple chunks and confirm collision
+   remains present on both sides of each boundary.
+4. Start Mario at several distant 3D cursor positions in separate sessions.
+5. Walk across several chunk boundaries and confirm each switch briefly pauses,
+   keeps the same Studio Session, and resumes control.
+6. Return to a visited region and confirm chunk-cache hits in the console.
+7. Move one contributing object, revisit the region, and confirm only affected
+   object/chunk entries rebuild.
+8. Edit mesh vertices, revisit the region, and confirm the geometry fingerprint
+   prevents stale collision reuse.
+9. Record toward a boundary; confirm Mario stops, the explicit warning appears,
+   and no native delete/load/create occurs until recording stops.
+10. End the Studio Session after multiple switches and confirm one final Mario
+    deletion and one global termination, with no stale timer remaining.
+11. Start another Studio Session and cross a boundary again.
+12. Save and reopen the `.blend`; confirm baked takes are unchanged and playable.
 
 ### Baked-performance asset persistence test
 

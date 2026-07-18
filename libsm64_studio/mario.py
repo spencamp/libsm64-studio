@@ -8,8 +8,11 @@ import ctypes as ct
 import math
 import mathutils
 import uuid
-from typing import cast, List
 from . collision_types import COLLISION_TYPES
+from . collision_cache import (
+    NATIVE_SAFETY_MARGIN, chunk_bounds, chunk_coordinate, chunk_size_for_scale,
+    collision_cache, set_collision_status,
+)
 from . recording import recorder
 
 if platform.system() == 'Windows':
@@ -45,6 +48,8 @@ original_fps_setting = 0
 original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
 simulation_scene = None
+_last_collision_preparation = None
+RUNTIME_API_VERSION = 3
 
 class SM64Surface(ct.Structure):
     _fields_ = [
@@ -130,6 +135,9 @@ class NativeLifecycle:
         self.live_object_name = ""
         self.scene = None
         self.input_started = False
+        self.collision_center = None
+        self.collision_stats = {}
+        self.collision_boundary_blocked = False
 
 
 _MODULE_OWNER_TOKEN = uuid.uuid4().hex
@@ -184,8 +192,17 @@ def lifecycle_snapshot():
         "shutdown_in_progress": session.shutdown_in_progress,
         "shutdown_complete": session.shutdown_complete,
         "session_committed": session.session_committed,
+        "collision_center": session.collision_center,
+        "collision_boundary_blocked": session.collision_boundary_blocked,
     }
 
+
+def _set_collision_status(message):
+    set_collision_status(message)
+    for window in getattr(bpy.context.window_manager, "windows", ()):
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 def _publish_session(session):
     _lifecycle_registry()["active"] = {
@@ -273,6 +290,12 @@ def _configure_native_api(library):
         ct.POINTER(SM64MarioGeometryBuffers),
     ]
     library.sm64_mario_tick.restype = None
+    # This setter is present in newer builds, but the bundled 2022 builds are
+    # not assumed to export it on every platform.
+    face_setter = getattr(library, "sm64_set_mario_faceangle", None)
+    if face_setter is not None:
+        face_setter.argtypes = [ct.c_uint32, ct.c_float]
+        face_setter.restype = None
 
 
 def _make_tick_timer(session):
@@ -370,6 +393,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     global _lifecycle, sm64, sm64_mario_id
     global SM64_SCALE_FACTOR, original_fps, original_fps_setting
     global original_fps_base, tick_count, origin_offset, original_cursor_pos, follow_cam, simulation_scene
+    global _last_collision_preparation
 
     try:
         rom_bytes = _read_validated_rom(rom_path)
@@ -384,6 +408,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     session = _new_lifecycle()
     _lifecycle = session
     _publish_session(session)
+    _last_collision_preparation = None
 
     SM64_SCALE_FACTOR = scale
     try:
@@ -426,11 +451,18 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         initialize_all_data(texture_buff)
 
         (surface_array, surface_array_len) = get_surface_array_from_scene()
+        preparation = _last_collision_preparation
+        if preparation is not None:
+            origin_offset[:] = preparation.origin
+            session.collision_center = preparation.center
+            session.collision_stats = dict(preparation.stats)
         session.library.sm64_static_surfaces_load(surface_array, surface_array_len)
 
         session.mario_create_attempted = True
         _lifecycle_log(session, "Mario create started")
-        mario_id = int(session.library.sm64_mario_create(0, 0, 0))
+        spawn_world = tuple(original_cursor_pos)
+        spawn = _native_position_from_world(spawn_world)
+        mario_id = int(session.library.sm64_mario_create(*spawn))
         if mario_id < 0:
             _lifecycle_log(session, "Mario create failed")
             raise MarioLifecycleError("There is no ground under the 3D cursor where Mario can spawn")
@@ -454,6 +486,9 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         tick_count = 0
         session.session_committed = True
         session.control_state = LIVE_IDLE
+        _set_collision_status(
+            "Nearby collision ready: {} surfaces".format(surface_array_len)
+        )
         _install_tick_timer(session)
         return None
     except Exception as exc:
@@ -602,6 +637,7 @@ def capture_mario_starting_mark():
         ),
         "face_angle": float(mario_state.faceAngle),
         "health": int(mario_state.health),
+        "world_position": _world_position_from_native(mario_state),
     }
 
 
@@ -683,8 +719,23 @@ def restore_mario_starting_mark(mark):
     session = _lifecycle
     if not is_mario_running():
         raise RuntimeError("Live Mario is unavailable")
-    position = mark["position"]
-    spawn = tuple(max(-32768, min(32767, int(round(value)))) for value in position)
+    world_position = mark.get("world_position")
+    if world_position is None:
+        native_position = mark["position"]
+        world_position = (
+            origin_offset[0] + native_position[0] / SM64_SCALE_FACTOR,
+            origin_offset[1] - native_position[2] / SM64_SCALE_FACTOR,
+            origin_offset[2] + native_position[1] / SM64_SCALE_FACTOR,
+        )
+    target_chunk = chunk_coordinate(world_position, chunk_size_for_scale(SM64_SCALE_FACTOR))
+    if session.collision_center is not None and target_chunk != session.collision_center:
+        _replace_collision_and_mario(session, world_position, mark.get("face_angle", 0.0))
+        tick_count = 0
+        return session.mario_id
+    # Within the same native origin, retain the exact public-state values used
+    # by the established Start Mark behavior (including its rounding contract).
+    spawn = tuple(max(-32768, min(32767, int(round(value))))
+                  for value in mark["position"])
     old_id = session.mario_id
     try:
         session.library.sm64_mario_delete(old_id)
@@ -716,6 +767,7 @@ def restore_mario_starting_mark(mark):
     session.mario_id = replacement_id
     session.mario_created = True
     sm64_mario_id = replacement_id
+    _restore_facing_if_supported(session, mark.get("face_angle", 0.0))
 
     _clear_transient_input_state(session)
     session.library.sm64_mario_tick(
@@ -755,10 +807,15 @@ def begin_mario_recording(scene, reset_to_mark=False):
     if recorder.has_pending_samples:
         raise RuntimeError("Cancel or finish the pending take before recording again")
     try:
+        if session.collision_boundary_blocked:
+            _replace_collision_and_mario(
+                session, _world_position_from_native(mario_state), float(mario_state.faceAngle)
+            )
         if reset_to_mark:
             reset_to_persistent_start_mark()
         recorder.start(float(scene.frame_current), get_simulation_target_fps(scene))
         session.recording_tick_origin = tick_count
+        session.collision_boundary_blocked = False
         session.control_state = RECORDING
         _install_tick_timer(session)
     except Exception:
@@ -778,6 +835,11 @@ def freeze_mario_recording_for_bake():
     except Exception:
         session.control_state = LIVE_IDLE if is_mario_running() else STOPPED
         raise
+    if session.collision_boundary_blocked:
+        session.control_state = RESETTING
+        _replace_collision_and_mario(
+            session, _world_position_from_native(mario_state), float(mario_state.faceAngle)
+        )
     session.control_state = BAKING
     return samples
 
@@ -955,6 +1017,9 @@ def tick_mario(scene, depsgraph=None, _session=None):
         stop_tick_mario(_session=session)
         return 0
 
+    if _handle_collision_boundary(session, scene):
+        return 0
+
     if session.neutral_input_ticks > 0:
         _clear_transient_input_state(session)
         session.neutral_input_ticks -= 1
@@ -1025,100 +1090,134 @@ def tick_mario(scene, depsgraph=None, _session=None):
     if view3d is not None:
         view3d.tag_redraw()
 
-def clamp_bounds(val):
-    val = int(val)
-    bounds = 0x7FFF
-    if val < -bounds:
-        return (-bounds, False)
-    if val > bounds:
-        return (bounds, False)
-    return (val, True)
+def _world_position_from_native(state):
+    return (
+        origin_offset[0] + float(state.posX) / SM64_SCALE_FACTOR,
+        origin_offset[1] - float(state.posZ) / SM64_SCALE_FACTOR,
+        origin_offset[2] + float(state.posY) / SM64_SCALE_FACTOR,
+    )
+
+
+def _native_position_from_world(position):
+    values = (
+        SM64_SCALE_FACTOR * (position[0] - origin_offset[0]),
+        SM64_SCALE_FACTOR * (position[2] - origin_offset[2]),
+        SM64_SCALE_FACTOR * (-position[1] + origin_offset[1]),
+    )
+    rounded = tuple(int(round(value)) for value in values)
+    if any(value < -32768 or value > 32767 for value in rounded):
+        raise MarioLifecycleError("Mario spawn is outside the prepared collision neighborhood")
+    return rounded
+
+
+def _prepare_collision(world_position, scene=None):
+    global _last_collision_preparation
+    scene = scene or bpy.context.scene
+    _last_collision_preparation = collision_cache.prepare(
+        scene, world_position, SM64_SCALE_FACTOR, SM64Surface, COLLISION_TYPES,
+        depsgraph=bpy.context.evaluated_depsgraph_get(),
+        status_callback=_set_collision_status,
+    )
+    return _last_collision_preparation
+
 
 def get_surface_array_from_scene():
-    global origin_offset
+    """Compatibility entry point returning only the active chunk neighborhood."""
+    preparation = _prepare_collision(tuple(bpy.context.scene.cursor.location))
+    return preparation.surface_array, preparation.surface_count
 
-    surfaces = get_all_surfaces()
-    surface_array = (SM64Surface * len(surfaces))()
 
-    j = 0
+def _restore_facing_if_supported(session, face_angle):
+    setter = getattr(session.library, "sm64_set_mario_faceangle", None)
+    if setter is not None:
+        setter(session.mario_id, float(face_angle))
 
-    for i in range(len(surfaces)):
-        (v0x, in00) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v0x'] - origin_offset[0]))
-        (v0y, in01) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v0z'] - origin_offset[2]))
-        (v0z, in02) = clamp_bounds(SM64_SCALE_FACTOR * (-surfaces[i]['v0y'] + origin_offset[1]))
-        (v1x, in10) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v1x'] - origin_offset[0]))
-        (v1y, in11) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v1z'] - origin_offset[2]))
-        (v1z, in12) = clamp_bounds(SM64_SCALE_FACTOR * (-surfaces[i]['v1y'] + origin_offset[1]))
-        (v2x, in20) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v2x'] - origin_offset[0]))
-        (v2y, in21) = clamp_bounds(SM64_SCALE_FACTOR * ( surfaces[i]['v2z'] - origin_offset[2]))
-        (v2z, in22) = clamp_bounds(SM64_SCALE_FACTOR * (-surfaces[i]['v2y'] + origin_offset[1]))
 
-        if not in00 and not in01 and not in02:
-            continue
-        if not in10 and not in11 and not in12:
-            continue
-        if not in20 and not in21 and not in22:
-            continue
+def _replace_collision_and_mario(session, world_position, face_angle):
+    """Replace collision between ticks without leaving stale native pointers."""
+    global sm64_mario_id, origin_offset
+    old_id = session.mario_id
+    _set_collision_status("Preparing nearby collision…")
+    try:
+        session.library.sm64_mario_delete(old_id)
+    except Exception as exc:
+        session.mario_delete_attempted = True
+        _poison_session(session, "Mario chunk-transition delete failed: {}".format(exc))
+        raise MarioLifecycleError(session.last_error)
+    session.mario_created = False
+    session.mario_id = -1
+    sm64_mario_id = -1
 
-        surface_array[j].surftype = surfaces[i]['surftype']
-        surface_array[j].force = 0
-        surface_array[j].terrain = surfaces[i]['terrain']
-        surface_array[j].v0x = v0x
-        surface_array[j].v0y = v0y
-        surface_array[j].v0z = v0z
-        surface_array[j].v1x = v1x
-        surface_array[j].v1y = v1y
-        surface_array[j].v1z = v1z
-        surface_array[j].v2x = v2x
-        surface_array[j].v2y = v2y
-        surface_array[j].v2z = v2z
-        j += 1
+    preparation = _prepare_collision(world_position, session.scene)
+    session.library.sm64_static_surfaces_load(
+        preparation.surface_array, preparation.surface_count
+    )
+    origin_offset[:] = preparation.origin
+    spawn = _native_position_from_world(world_position)
+    try:
+        replacement_id = int(session.library.sm64_mario_create(*spawn))
+    except Exception as exc:
+        session.native_ownership_uncertain = True
+        _poison_session(session, "Mario chunk-transition creation failed: {}".format(exc))
+        raise MarioLifecycleError(session.last_error)
+    if replacement_id < 0:
+        _poison_session(session, "Could not recreate Mario after loading nearby collision")
+        raise MarioLifecycleError(session.last_error)
+    session.mario_id = replacement_id
+    session.mario_created = True
+    sm64_mario_id = replacement_id
+    session.collision_center = preparation.center
+    session.collision_stats = dict(preparation.stats)
+    session.collision_boundary_blocked = False
+    mario_state.posX, mario_state.posY, mario_state.posZ = spawn
+    _restore_facing_if_supported(session, face_angle)
+    _clear_transient_input_state(session)
+    _set_collision_status(
+        "Nearby collision loaded: {} surfaces ({} chunk hits, {} misses)".format(
+            preparation.surface_count,
+            preparation.stats["chunk_cache_hits"],
+            preparation.stats["chunk_cache_misses"],
+        )
+    )
 
-    return (surface_array, j)
 
-def get_all_surfaces():
-    def add_mesh(obj: bpy.types.Object, out):
-        mesh = obj.data
-        mesh.calc_loop_triangles()
-        for tri in cast(List[bpy.types.MeshLoopTriangle], mesh.loop_triangles):
-            out_elem = {}
-            for i in range(3):
-                tri_idx = tri.vertices[i]
-                vx = mesh.vertices[tri_idx].co.x
-                vy = mesh.vertices[tri_idx].co.y
-                vz = mesh.vertices[tri_idx].co.z
-                vworld = obj.matrix_world @ mathutils.Vector((vx, vy, vz, 1))
-                out_elem['v' + str(i) + 'x'] = vworld.x
-                out_elem['v' + str(i) + 'y'] = vworld.y
-                out_elem['v' + str(i) + 'z'] = vworld.z
-
-            out_elem['terrain'] = COLLISION_TYPES['TERRAIN_GRASS']
-            seek = obj
-            while True:
-                if hasattr(seek, 'sm64_obj_type') and seek.sm64_obj_type == 'Area Root' and hasattr(seek, 'terrainEnum'):
-                    out_elem['terrain'] = COLLISION_TYPES[seek.terrainEnum]
-                    break
-                if seek.parent:
-                    seek = seek.parent
-                else:
-                    break
-
-            out_elem['surftype'] = COLLISION_TYPES['SURFACE_DEFAULT']
-            if tri.material_index > 0 and tri.material_index < len(mesh.materials):
-                mat = mesh.materials[tri.material_index]
-                if hasattr(mat, 'collision_type_simple'):
-                    out_elem['surftype'] = COLLISION_TYPES[mat.collision_type_simple]
-
-            out.append(out_elem)
-
-    scene = bpy.context.window.scene
-    out = []
-
-    for obj in cast(List[bpy.types.Object], scene.collection.all_objects):
-        if isinstance(obj.data, bpy.types.Mesh) and not obj.get('libsm64_is_bake', False):
-            add_mesh(obj, out)
-
-    return out
+def _handle_collision_boundary(session, scene):
+    if session.collision_center is None:
+        return False
+    world_position = _world_position_from_native(mario_state)
+    size = chunk_size_for_scale(SM64_SCALE_FACTOR)
+    current = chunk_coordinate(world_position, size)
+    if current == session.collision_center:
+        session.collision_boundary_blocked = False
+        return False
+    # A quarter of the same native safety reserve used for chunk sizing gives
+    # transitions hysteresis. This prevents floor-level rounding around a grid
+    # plane from repeatedly switching 3D chunks while a full neighbor is loaded.
+    bounds = chunk_bounds(session.collision_center, size)
+    hysteresis = (NATIVE_SAFETY_MARGIN * 0.25) / SM64_SCALE_FACTOR
+    beyond_hysteresis = any(
+        world_position[axis] < bounds[0][axis] - hysteresis
+        or world_position[axis] > bounds[1][axis] + hysteresis
+        for axis in range(3)
+    )
+    if not beyond_hysteresis:
+        session.collision_boundary_blocked = False
+        return False
+    if recorder.active or session.control_state == RECORDING:
+        session.collision_boundary_blocked = True
+        _clear_transient_input_state(session)
+        _set_collision_status(
+            "Collision region boundary reached. Stop recording to load the next area."
+        )
+        return True
+    previous_state = session.control_state
+    session.control_state = RESETTING
+    try:
+        _replace_collision_and_mario(session, world_position, float(mario_state.faceAngle))
+    finally:
+        if session.control_state != POISONED:
+            session.control_state = previous_state
+    return False
 
 def _new_mario_texture_image():
     image = bpy.data.images.new(

@@ -82,10 +82,23 @@ function Invoke-BlenderTest([string]$Label, [string]$TestScript) {
     Write-Host "[$Label] PASS"
 }
 
+function Install-StagedPackageClean {
+    $resolvedAddonRoot = [System.IO.Path]::GetFullPath($addonRoot)
+    $resolvedTarget = [System.IO.Path]::GetFullPath($installedPackage)
+    $requiredPrefix = $resolvedAddonRoot.TrimEnd('\') + '\'
+    if (-not $resolvedTarget.StartsWith($requiredPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to replace an add-on outside the isolated test root: $resolvedTarget"
+    }
+    if (Test-Path -LiteralPath $resolvedTarget) {
+        Remove-Item -LiteralPath $resolvedTarget -Recurse -Force
+    }
+    Copy-Item -LiteralPath $stagedPackage -Destination $addonRoot -Recurse -Force -ErrorAction Stop
+}
+
 try {
     New-Item -ItemType Directory -Path $stagedPackage, $addonRoot, $userConfig, $userData, $userExtensions, $blendRoot -Force | Out-Null
 
-    foreach ($name in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "input_reader.py", "input_reader_win.py", "collision_types.py", "zeth_inputs.py")) {
+    foreach ($name in @("__init__.py", "mario.py", "collision_cache.py", "recording.py", "take_manager.py", "input_reader.py", "input_reader_win.py", "collision_types.py", "zeth_inputs.py")) {
         Assert-MirrorFile $name
     }
 
@@ -106,7 +119,7 @@ try {
         throw "Could not stage packaged add-on files (a file may be locked): $($_.Exception.Message)"
     }
 
-    foreach ($required in @("__init__.py", "mario.py", "recording.py", "take_manager.py", "lib\sm64.dll", "lib\SDL2.dll")) {
+    foreach ($required in @("__init__.py", "mario.py", "collision_cache.py", "recording.py", "take_manager.py", "lib\sm64.dll", "lib\SDL2.dll")) {
         if (-not (Test-Path -LiteralPath (Join-Path $stagedPackage $required) -PathType Leaf)) {
             throw "Staged add-on is missing required file: libsm64_studio\$required"
         }
@@ -137,7 +150,7 @@ try {
         if ($entryDifference) {
             throw "Generated add-on ZIP contents differ from the staged install: $($entryDifference | Out-String)"
         }
-        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/SDL2.dll")) {
+        foreach ($required in @("libsm64_studio/__init__.py", "libsm64_studio/mario.py", "libsm64_studio/collision_cache.py", "libsm64_studio/lib/sm64.dll", "libsm64_studio/lib/SDL2.dll")) {
             if ($entries -notcontains $required) {
                 throw "Generated add-on ZIP is missing $required"
             }
@@ -147,7 +160,15 @@ try {
     }
 
     try {
-        Copy-Item -LiteralPath $stagedPackage -Destination $addonRoot -Recurse -Force -ErrorAction Stop
+        # Exercise upgrading over an existing directory. A clean replacement is
+        # required because Blender's overlay installer can otherwise leave old
+        # modules and bytecode beside a new __init__.py.
+        New-Item -ItemType Directory -Path $installedPackage -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $installedPackage "stale-upgrade-file.py") -Value "old"
+        Install-StagedPackageClean
+        if (Test-Path -LiteralPath (Join-Path $installedPackage "stale-upgrade-file.py")) {
+            throw "Clean package upgrade retained a stale file"
+        }
     } catch {
         throw "Could not install the staged add-on into the isolated test directory: $($_.Exception.Message)"
     }
@@ -172,6 +193,8 @@ try {
         Invoke-BlenderTest "Start Mark regression" (Join-Path $repoRoot "tests\blender_start_mark_test.py")
         Invoke-BlenderTest "Timeline Start Frame regression" (Join-Path $repoRoot "tests\blender_timeline_start_frame_test.py")
         Invoke-BlenderTest "native lifecycle regression" (Join-Path $repoRoot "tests\blender_native_lifecycle_test.py")
+        Invoke-BlenderTest "collision cache regression" (Join-Path $repoRoot "tests\blender_collision_cache_test.py")
+        Invoke-BlenderTest "collision transition regression" (Join-Path $repoRoot "tests\blender_collision_transition_test.py")
         Invoke-BlenderTest "three-take regression" (Join-Path $repoRoot "tests\blender_three_take_regression_test.py")
     }
 

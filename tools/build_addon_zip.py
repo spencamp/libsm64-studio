@@ -38,6 +38,18 @@ def _mario_imports(path: Path) -> set[str]:
     }
 
 
+def relative_import_contract(path: Path) -> dict[str, set[str]]:
+    """Return every explicit ``from .module import name`` used by the package."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    contract = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or node.level != 1 or not node.module:
+            continue
+        names = {alias.name for alias in node.names if alias.name != "*"}
+        contract.setdefault(node.module, set()).update(names)
+    return contract
+
+
 def validate_package(root: Path) -> None:
     package = root / "libsm64_studio"
     if not package.is_dir():
@@ -65,6 +77,18 @@ def validate_package(root: Path) -> None:
             "Packaged __init__.py does not import: {}".format(", ".join(sorted(missing_imports)))
         )
 
+    for module_name, imported_names in relative_import_contract(package / "__init__.py").items():
+        module_path = package / (module_name + ".py")
+        if not module_path.is_file():
+            raise RuntimeError("Packaged __init__.py imports missing module: {}".format(module_name))
+        missing_names = imported_names - _top_level_symbols(module_path)
+        if missing_names:
+            raise RuntimeError(
+                "Packaged __init__.py imports missing symbols from {}: {}".format(
+                    module_name, ", ".join(sorted(missing_names))
+                )
+            )
+
 
 def build_archive(root: Path, output: Path) -> None:
     validate_package(root)
@@ -79,6 +103,15 @@ def build_archive(root: Path, output: Path) -> None:
             if "__pycache__" in source.parts or source.suffix in {".pyc", ".pyo"}:
                 continue
             archive.write(source, source.relative_to(root).as_posix())
+    with zipfile.ZipFile(temporary) as archive:
+        names = archive.namelist()
+        if not names or any(
+            not name.startswith("libsm64_studio/")
+            or name.startswith("libsm64_studio/libsm64_studio/")
+            for name in names
+        ):
+            temporary.unlink()
+            raise RuntimeError("Archive has an invalid or nested add-on package layout")
     try:
         temporary.replace(output)
     except PermissionError:

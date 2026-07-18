@@ -5,6 +5,7 @@ Run with:
 """
 
 from pathlib import Path
+import ast
 import importlib
 import os
 import sys
@@ -20,6 +21,17 @@ REQUIRED_MARIO_API = (
     "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
 )
 
+
+def assert_init_import_contract(package_path):
+    tree = ast.parse((package_path / "__init__.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or node.level != 1 or not node.module:
+            continue
+        module = importlib.import_module("libsm64_studio.{}".format(node.module))
+        for alias in node.names:
+            if alias.name != "*":
+                assert hasattr(module, alias.name), "{}.{}".format(node.module, alias.name)
+
 root = Path(__file__).resolve().parents[1]
 
 configured_install = os.environ.get("LIBSM64_EXPECTED_INSTALL_ROOT")
@@ -31,6 +43,10 @@ if configured_install:
     assert expected_package in Path(addon.__file__).resolve().parents
     assert expected_package in Path(mario.__file__).resolve().parents
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
+    assert_init_import_contract(expected_package)
+    cache_module = importlib.import_module("libsm64_studio.collision_cache")
+    assert addon.clear_collision_cache is cache_module.clear_collision_cache
+    assert bpy.ops.view3d.libsm64_clear_collision_cache() == {'FINISHED'}
 
     # The bootstrap enabled (registered) the package. Exercise unregistration
     # and registration once more through Blender's real add-on lifecycle.
@@ -39,6 +55,8 @@ if configured_install:
     addon = importlib.import_module("libsm64_studio")
     mario = importlib.import_module("libsm64_studio.mario")
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
+    assert mario.RUNTIME_API_VERSION == 3
+    assert_init_import_contract(expected_package)
     assert addon.BAKING == mario.BAKING
     assert addon.POISONED == mario.POISONED
     print("libsm64 packaged enable/import/register/unregister smoke passed")
@@ -72,11 +90,11 @@ else:
 
             # Reproduce an overlay update in one Blender process: the new package
             # initializer sees an older cached mario submodule missing its new API.
-            for symbol in REQUIRED_MARIO_API:
-                mario.__dict__.pop(symbol, None)
+            mario.RUNTIME_API_VERSION = 0
             addon = importlib.reload(addon)
             mario = importlib.import_module("libsm64_studio.mario")
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
+            assert mario.RUNTIME_API_VERSION == 3
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
         finally:

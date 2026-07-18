@@ -47,6 +47,39 @@ class PackageImportContractTests(unittest.TestCase):
                 top_level_assignments(base / "mario.py") & LIFECYCLE_SYMBOLS,
                 LIFECYCLE_SYMBOLS,
             )
+
+    def test_every_explicit_init_import_exists_in_its_owner_module(self):
+        for base in (ROOT, PACKAGE):
+            init_tree = ast.parse((base / "__init__.py").read_text(encoding="utf-8"))
+            for node in init_tree.body:
+                if not isinstance(node, ast.ImportFrom) or node.level != 1 or not node.module:
+                    continue
+                module_path = base / (node.module + ".py")
+                self.assertTrue(module_path.is_file(), node.module)
+                symbols = top_level_assignments(module_path)
+                module_tree = ast.parse(module_path.read_text(encoding="utf-8"))
+                symbols.update(
+                    item.name for item in module_tree.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                )
+                for alias in node.names:
+                    if alias.name != "*":
+                        self.assertIn(alias.name, symbols, "{}.{}".format(node.module, alias.name))
+
+    def test_collision_cache_api_has_one_clear_owner(self):
+        for base in (ROOT, PACKAGE):
+            mario_source = (base / "mario.py").read_text(encoding="utf-8")
+            cache_source = (base / "collision_cache.py").read_text(encoding="utf-8")
+            mario_defs = {
+                node.name for node in ast.parse(mario_source).body
+                if isinstance(node, ast.FunctionDef)
+            }
+            cache_defs = {
+                node.name for node in ast.parse(cache_source).body
+                if isinstance(node, ast.FunctionDef)
+            }
+            self.assertNotIn("clear_collision_cache", mario_defs)
+            self.assertIn("clear_collision_cache", cache_defs)
             self.assertEqual(
                 mario_imports(base / "__init__.py") & LIFECYCLE_SYMBOLS,
                 LIFECYCLE_SYMBOLS,

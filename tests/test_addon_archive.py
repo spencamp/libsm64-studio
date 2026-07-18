@@ -28,6 +28,9 @@ class AddonArchiveTests(unittest.TestCase):
             self.assertEqual(names, set(expected))
             self.assertFalse(any("__pycache__" in name for name in names))
             self.assertFalse(any(name.endswith((".pyc", ".pyo")) for name in names))
+            self.assertFalse(any(
+                name.startswith("libsm64_studio/libsm64_studio/") for name in names
+            ))
             for name, source in expected.items():
                 self.assertEqual(
                     archive.read(name), source.read_bytes(),
