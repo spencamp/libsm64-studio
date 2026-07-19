@@ -108,6 +108,15 @@ else:
             assert mario.RUNTIME_API_VERSION == 8
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
+
+            # A recording-only API addition must also invalidate an older
+            # cached recording module even when mario.py's API is unchanged.
+            recording = importlib.import_module("libsm64_studio.recording")
+            del recording.scene_rate_matches_sample_rate
+            addon = importlib.reload(addon)
+            recording = importlib.import_module("libsm64_studio.recording")
+            assert hasattr(recording, "scene_rate_matches_sample_rate")
+            assert hasattr(recording, "timeline_playback")
         finally:
             sys.path.remove(str(install_root))
             for name in list(sys.modules):

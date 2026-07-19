@@ -163,12 +163,15 @@ class PackageImportContractTests(unittest.TestCase):
 
     def test_live_simulation_is_not_coupled_to_timeline_playback(self):
         source = (PACKAGE / "mario.py").read_text(encoding="utf-8")
+        operator_source = (PACKAGE / "__init__.py").read_text(encoding="utf-8")
         self.assertNotIn("animation_play", source)
         self.assertNotIn("animation_cancel", source)
         self.assertNotIn("frame_change_pre.append", source)
         self.assertNotIn("render.fps = 30", source)
         self.assertIn("bpy.app.timers.register", source)
         self.assertIn("_libsm64_generation", source)
+        self.assertIn("animation_play", operator_source)
+        self.assertIn("animation_cancel(restore_frame=False)", operator_source)
 
     def test_fast_mesh_update_uses_bulk_coordinates_without_bmesh(self):
         source = (PACKAGE / "mario.py").read_text(encoding="utf-8")

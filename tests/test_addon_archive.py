@@ -3,9 +3,10 @@ import hashlib
 import json
 import tempfile
 import unittest
+import warnings
 import zipfile
 
-from tools.build_addon_zip import build_archive, validate_package
+from tools.build_addon_zip import build_archive, validate_archive, validate_package
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +47,7 @@ class AddonArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             archive_path = Path(directory) / "libsm64_studio.zip"
             build_archive(ROOT, archive_path)
+            validate_archive(ROOT, archive_path)
             self.assert_archive_matches_package(archive_path)
             with zipfile.ZipFile(archive_path) as archive:
                 mario_source = archive.read("libsm64_studio/mario.py").decode("utf-8")
@@ -73,6 +75,22 @@ class AddonArchiveTests(unittest.TestCase):
                         hashlib.sha256(archive.read(archive_name)).hexdigest(),
                         manifest["artifacts"][artifact_name]["sha256"],
                     )
+
+    def test_final_archive_validation_rejects_a_stale_package_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "libsm64_studio.zip"
+            build_archive(ROOT, archive_path)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(archive_path, "a") as archive:
+                    archive.writestr(
+                        "libsm64_studio/recording.py",
+                        "# stale recording module without imported helpers\n",
+                    )
+            with self.assertRaisesRegex(
+                RuntimeError, "duplicate entries|stale package file"
+            ):
+                validate_archive(ROOT, archive_path)
 
 if __name__ == "__main__":
     unittest.main()

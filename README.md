@@ -199,12 +199,14 @@ Mario and any number of baked takes:
    animation, and flags.
 3. Move the timeline to the desired output start frame and click **Set Start
    Frame**. Enable **Start recording from saved frame** to return to this frame
-   automatically before each new capture and after each bake or cancel. **Go to Start Frame** recalls it
-   manually. The Timeline Start Frame is stored in the `.blend` and remains
-   independent of Mario's spatial Start Mark.
-4. Click **Start Recording**. Recording does not move Mario or replace the Mario
-   Start Mark by default, so you may intentionally begin a take from somewhere
-   else.
+   automatically before each new capture. **Go to Start Frame** recalls it
+   manually. Finishing or canceling preserves the frame reached by playback.
+   The Timeline Start Frame is stored in the `.blend` and remains independent
+   of Mario's spatial Start Mark.
+4. Click **Start Recording**. Blender timeline playback begins from the current
+   frame so cameras, plates, lights, and other animation evaluate during the
+   performance. Recording does not move Mario or replace the Mario Start Mark
+   by default, so you may intentionally begin a take from somewhere else.
 5. Optionally enable **Reset to Mark when recording starts** to reset and resume
    simulation at the mark before capture begins. This option is unavailable
    until the active Live Mario session has a valid mark.
@@ -215,10 +217,12 @@ Mario and any number of baked takes:
    reject it, keep rehearsing immediately, or click **Start Recording** for
    another take without reinserting Mario.
 
-Live simulation runs from one add-on-owned Blender timer at approximately 30 Hz.
-It is independent of timeline playback and never changes the scene's render FPS
-or FPS base. Timeline playback and scrubbing therefore remain available at the
-chosen output rate while Live Mario continues to respond. Idle/rehearsal ticks
+Live simulation runs from one add-on-owned Blender timer at approximately 30 Hz
+and never changes the scene's render FPS or FPS base. Recording starts Blender's
+native timeline playback when needed; if playback was already running, the
+add-on leaves it running when recording ends. At scene rates other than 30 FPS,
+the UI reports the mismatch and the bake maps each 30 Hz sample to fractional or
+multi-frame scene positions. Idle/rehearsal ticks
 update only Live Mario; geometry enters the recorder only between **Start
 Recording** and **Stop & Bake**.
 

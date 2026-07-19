@@ -54,19 +54,26 @@ scene.frame_set(333)
 begin_calls = []
 real_is_mario_running = addon.is_mario_running
 real_begin_mario_recording = addon.begin_mario_recording
+real_begin_timeline_playback = addon._begin_recording_timeline_playback
 addon.is_mario_running = lambda: True
 addon.begin_mario_recording = lambda target_scene, reset_to_mark=False: begin_calls.append(
     (target_scene.frame_current, reset_to_mark)
+)
+playback_calls = []
+addon._begin_recording_timeline_playback = lambda target_context: playback_calls.append(
+    target_context.scene.frame_current
 )
 try:
     assert addon.StartRecording_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
 finally:
     addon.is_mario_running = real_is_mario_running
     addon.begin_mario_recording = real_begin_mario_recording
+    addon._begin_recording_timeline_playback = real_begin_timeline_playback
 assert begin_calls == [(120, False)]
+assert playback_calls == [120]
 
-# Successful bake and cancel transitions recall the frame automatically, while
-# leaving the setting independent from take registration and selection.
+# Successful bake and cancel transitions preserve the reached frame.  The saved
+# frame remains an explicit/manual or next-recording start point only.
 real_freeze = addon.freeze_mario_recording_for_bake
 real_bake = addon.bake_shape_keys
 real_register = addon.register_baked_take
@@ -85,12 +92,12 @@ try:
     addon.recorder.target_fps = 30.0
     scene.frame_set(444)
     assert addon.StopAndBake_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
-    assert scene.frame_current == 120
+    assert scene.frame_current == 444
     assert transitions == ["resume"]
 
     scene.frame_set(555)
     assert addon.CancelRecording_OT_Operator.execute(reporter, bpy.context) == {'FINISHED'}
-    assert scene.frame_current == 120
+    assert scene.frame_current == 555
     assert transitions == ["resume", "resume"]
 
     settings.start_recording_from_saved_frame = False

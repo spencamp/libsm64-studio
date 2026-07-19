@@ -27,6 +27,64 @@ class RecordingError(RuntimeError):
     pass
 
 
+def scene_rate_matches_sample_rate(target_fps, sample_fps=SAMPLE_FPS):
+    """Return whether scene playback and Mario capture have the same cadence."""
+    try:
+        target_fps = float(target_fps)
+        sample_fps = float(sample_fps)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        math.isfinite(target_fps)
+        and math.isfinite(sample_fps)
+        and target_fps > 0.0
+        and sample_fps > 0.0
+        and math.isclose(target_fps, sample_fps, rel_tol=0.0, abs_tol=1e-6)
+    )
+
+
+class TimelinePlaybackOwner:
+    """Own at most one externally implemented timeline playback session.
+
+    Blender-specific callbacks are supplied only when playback is acquired, so
+    this state machine stays unit-testable without importing ``bpy``.  Release
+    clears ownership before invoking callbacks to make reentrant cleanup safe.
+    """
+
+    def __init__(self):
+        self._owned = False
+        self._is_playing = None
+        self._stop_playback = None
+
+    @property
+    def owns_playback(self):
+        return self._owned
+
+    def acquire(self, is_playing, start_playback, stop_playback):
+        if self._owned or is_playing():
+            return False
+        start_playback()
+        self._owned = True
+        self._is_playing = is_playing
+        self._stop_playback = stop_playback
+        return True
+
+    def release(self):
+        if not self._owned:
+            return False
+        is_playing = self._is_playing
+        stop_playback = self._stop_playback
+        self._owned = False
+        self._is_playing = None
+        self._stop_playback = None
+        if is_playing is not None and is_playing():
+            stop_playback()
+        return True
+
+
+timeline_playback = TimelinePlaybackOwner()
+
+
 def _copy_coordinates(coordinates):
     try:
         copied = array('f', coordinates)

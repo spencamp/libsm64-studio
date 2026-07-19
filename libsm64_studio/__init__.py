@@ -13,22 +13,31 @@ _MARIO_REQUIRED_API = (
     "probe_collision_at_cursor", "set_mario_health",
     "set_mario_invincibility", "studio_diagnostics",
 )
+_RECORDING_REQUIRED_API = (
+    "SAMPLE_FPS", "scene_rate_matches_sample_rate", "timeline_playback",
+)
 _RUNTIME_API_VERSION = 8
 
 
 def _reload_stale_runtime_modules():
-    """Refresh an older cached submodule before importing the packaged API.
+    """Refresh older cached submodules before importing the packaged API.
 
     Blender can execute a newly installed package ``__init__.py`` while keeping
-    submodules from the previous add-on version in ``sys.modules``.  Reload only
-    when the cached Mario module demonstrably lacks this package's required API.
+    submodules from the previous add-on version in ``sys.modules``. Reload only
+    when a cached runtime module lacks this package's required API.
     """
     mario_name = "{}.mario".format(__package__)
+    recording_name = "{}.recording".format(__package__)
     cached_mario = sys.modules.get(mario_name)
-    if cached_mario is None or (
+    cached_recording = sys.modules.get(recording_name)
+    mario_is_current = cached_mario is None or (
         getattr(cached_mario, "RUNTIME_API_VERSION", 0) == _RUNTIME_API_VERSION
         and all(hasattr(cached_mario, symbol) for symbol in _MARIO_REQUIRED_API)
-    ):
+    )
+    recording_is_current = cached_recording is None or all(
+        hasattr(cached_recording, symbol) for symbol in _RECORDING_REQUIRED_API
+    )
+    if mario_is_current and recording_is_current:
         return
 
     shutdown = getattr(cached_mario, "stop_tick_mario", None)
@@ -47,10 +56,24 @@ def _reload_stale_runtime_modules():
         if module is not None:
             importlib.reload(module)
     refreshed_mario = sys.modules.get(mario_name)
-    if getattr(refreshed_mario, "RUNTIME_API_VERSION", 0) != _RUNTIME_API_VERSION:
+    if cached_mario is not None and getattr(
+        refreshed_mario, "RUNTIME_API_VERSION", 0
+    ) != _RUNTIME_API_VERSION:
         raise RuntimeError(
             "LibSM64 Studio has a mixed-file installation. Remove the existing "
             "libsm64_studio add-on directory and reinstall the current ZIP."
+        )
+    refreshed_recording = sys.modules.get(recording_name)
+    if cached_recording is not None and (
+        refreshed_recording is None or not all(
+            hasattr(refreshed_recording, symbol)
+            for symbol in _RECORDING_REQUIRED_API
+        )
+    ):
+        raise RuntimeError(
+            "LibSM64 Studio has a mixed recording module installation. Remove "
+            "the existing libsm64_studio add-on directory and reinstall the "
+            "current ZIP."
         )
 
 
@@ -132,11 +155,14 @@ if RUNTIME_API_VERSION != _RUNTIME_API_VERSION:
     )
 from . recording import (
     RecordingError,
+    SAMPLE_FPS,
     bake_shape_keys,
     discard_baked_take,
     recorder,
     runtime_metadata_at_frame,
     sample_target_frame,
+    scene_rate_matches_sample_rate,
+    timeline_playback,
 )
 from .take_manager import (
     FAVORITE,
@@ -302,7 +328,7 @@ class LibSm64Properties(bpy.types.PropertyGroup):
     )
     start_recording_from_saved_frame : bpy.props.BoolProperty(
         name="Start recording from saved frame",
-        description="Return to the saved Timeline Start Frame when a recording starts or finishes",
+        description="Return to the saved Timeline Start Frame when a recording starts",
         default=False,
     )
     start_mark_restoration_mode : bpy.props.EnumProperty(
@@ -951,6 +977,38 @@ def _restore_timeline_start_frame(scene):
     return True
 
 
+def _begin_recording_timeline_playback(context):
+    """Start Blender playback once and retain only playback we own."""
+    window = getattr(context, "window", None)
+    screen = getattr(context, "screen", None)
+    if window is None or screen is None:
+        raise RuntimeError("Blender timeline playback requires an interactive window")
+
+    def is_playing():
+        try:
+            return bool(screen.is_animation_playing)
+        except ReferenceError:
+            return False
+
+    def run_screen_operator(operator, label):
+        try:
+            with bpy.context.temp_override(window=window, screen=screen):
+                result = operator()
+        except (ReferenceError, RuntimeError) as exc:
+            raise RuntimeError("Could not {} Blender timeline playback: {}".format(label, exc))
+        if 'FINISHED' not in result:
+            raise RuntimeError("Could not {} Blender timeline playback".format(label))
+
+    return timeline_playback.acquire(
+        is_playing,
+        lambda: run_screen_operator(bpy.ops.screen.animation_play, "start"),
+        lambda: run_screen_operator(
+            lambda: bpy.ops.screen.animation_cancel(restore_frame=False),
+            "stop",
+        ),
+    )
+
+
 class StartRecording_OT_Operator(bpy.types.Operator):
     bl_idname = "view3d.libsm64_start_recording"
     bl_label = "Start Recording"
@@ -970,6 +1028,7 @@ class StartRecording_OT_Operator(bpy.types.Operator):
         try:
             _restore_timeline_start_frame(context.scene)
             begin_mario_recording(context.scene, reset_to_mark=auto_reset)
+            _begin_recording_timeline_playback(context)
         except Exception as exc:
             abandon_bake_transition()
             recorder.fail(
@@ -978,7 +1037,18 @@ class StartRecording_OT_Operator(bpy.types.Operator):
             )
             self.report({'ERROR'}, recorder.message)
             return {'CANCELLED'}
-        self.report({'INFO'}, "Recording Mario performance")
+        if scene_rate_matches_sample_rate(recorder.target_fps):
+            self.report({'INFO'}, "Recording Mario performance at 30 Hz")
+        else:
+            self.report(
+                {'WARNING'},
+                "Mario records at {:.3g} Hz while the scene plays at {:.3g} FPS; "
+                "the bake maps each sample to {:.6g} scene frames".format(
+                    SAMPLE_FPS,
+                    recorder.target_fps,
+                    recorder.target_fps / SAMPLE_FPS,
+                ),
+            )
         return {'FINISHED'}
 
 
@@ -1324,14 +1394,6 @@ class StopAndBake_OT_Operator(bpy.types.Operator):
                 "{} was captured, but reset to Start Mark failed: {}".format(label, exc),
             )
             return {'FINISHED'}
-        try:
-            _restore_timeline_start_frame(context.scene)
-        except Exception as exc:
-            self.report(
-                {'ERROR'},
-                "{} was captured, but Timeline Start Frame restore failed: {}".format(label, exc),
-            )
-            return {'FINISHED'}
         _show_confirmation("âœ“ Take {:03d} captured".format(take_number))
         self.report(
             {'INFO'},
@@ -1352,11 +1414,6 @@ class CancelRecording_OT_Operator(bpy.types.Operator):
         except Exception as exc:
             abandon_bake_transition()
             self.report({'ERROR'}, "Recording discarded, but reset to Start Mark failed: {}".format(exc))
-            return {'FINISHED'}
-        try:
-            _restore_timeline_start_frame(context.scene)
-        except Exception as exc:
-            self.report({'ERROR'}, "Recording discarded, but Timeline Start Frame restore failed: {}".format(exc))
             return {'FINISHED'}
         self.report({'INFO'}, "Mario recording discarded")
         return {'FINISHED'}

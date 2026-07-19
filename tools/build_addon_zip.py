@@ -146,6 +146,40 @@ def validate_package(root: Path) -> None:
             )
 
 
+def validate_archive(root: Path, archive_path: Path) -> None:
+    """Verify the final install ZIP is an exact package-tree snapshot."""
+    package = root / "libsm64_studio"
+    expected = {
+        source.relative_to(root).as_posix(): source
+        for source in package.rglob("*")
+        if source.is_file()
+        and "__pycache__" not in source.parts
+        and source.suffix not in {".pyc", ".pyo"}
+    }
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise RuntimeError("Archive contains duplicate entries")
+        if any(
+            not name.startswith("libsm64_studio/")
+            or name.startswith("libsm64_studio/libsm64_studio/")
+            for name in names
+        ):
+            raise RuntimeError("Archive has an invalid or nested add-on package layout")
+        missing = set(expected) - set(names)
+        unexpected = set(names) - set(expected)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Archive/package file mismatch; missing: {}; unexpected: {}".format(
+                    ", ".join(sorted(missing)) or "none",
+                    ", ".join(sorted(unexpected)) or "none",
+                )
+            )
+        for name, source in expected.items():
+            if archive.read(name) != source.read_bytes():
+                raise RuntimeError("Archive contains stale package file: {}".format(name))
+
+
 def build_archive(root: Path, output: Path) -> None:
     validate_package(root)
     package = root / "libsm64_studio"
@@ -159,15 +193,7 @@ def build_archive(root: Path, output: Path) -> None:
             if "__pycache__" in source.parts or source.suffix in {".pyc", ".pyo"}:
                 continue
             archive.write(source, source.relative_to(root).as_posix())
-    with zipfile.ZipFile(temporary) as archive:
-        names = archive.namelist()
-        if not names or any(
-            not name.startswith("libsm64_studio/")
-            or name.startswith("libsm64_studio/libsm64_studio/")
-            for name in names
-        ):
-            temporary.unlink()
-            raise RuntimeError("Archive has an invalid or nested add-on package layout")
+    validate_archive(root, temporary)
     try:
         temporary.replace(output)
     except PermissionError:
@@ -176,6 +202,7 @@ def build_archive(root: Path, output: Path) -> None:
         # still avoids exposing a partially written ZIP.
         shutil.copyfile(temporary, output)
         temporary.unlink()
+    validate_archive(root, output)
 
 
 def main() -> None:

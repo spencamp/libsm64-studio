@@ -60,6 +60,96 @@ class FrameMappingTests(unittest.TestCase):
         self.assertEqual(recording.held_runtime_sample_index(-100, 10, 30, 4), 0)
         self.assertEqual(recording.held_runtime_sample_index(100, 10, 30, 4), 3)
 
+    def test_scene_rate_match_detection_is_strict_about_30_hz(self):
+        self.assertTrue(recording.scene_rate_matches_sample_rate(30.0))
+        self.assertTrue(recording.scene_rate_matches_sample_rate(30.0000005))
+        for target_fps in (24.0, 29.97, 60.0, 0.0, math.nan, "invalid"):
+            with self.subTest(target_fps=target_fps):
+                self.assertFalse(recording.scene_rate_matches_sample_rate(target_fps))
+
+
+class TimelinePlaybackOwnershipTests(unittest.TestCase):
+    def test_preexisting_playback_is_neither_started_nor_stopped(self):
+        owner = recording.TimelinePlaybackOwner()
+        calls = []
+
+        acquired = owner.acquire(
+            lambda: True,
+            lambda: calls.append("start"),
+            lambda: calls.append("stop"),
+        )
+
+        self.assertFalse(acquired)
+        self.assertFalse(owner.owns_playback)
+        self.assertFalse(owner.release())
+        self.assertEqual(calls, [])
+
+    def test_owned_playback_starts_and_stops_exactly_once(self):
+        owner = recording.TimelinePlaybackOwner()
+        state = {"playing": False}
+        calls = []
+
+        def start():
+            calls.append("start")
+            state["playing"] = True
+
+        def stop():
+            calls.append("stop")
+            state["playing"] = False
+
+        self.assertTrue(owner.acquire(lambda: state["playing"], start, stop))
+        self.assertTrue(owner.owns_playback)
+        self.assertFalse(owner.acquire(lambda: False, start, stop))
+        self.assertTrue(owner.release())
+        self.assertFalse(owner.release())
+        self.assertEqual(calls, ["start", "stop"])
+
+    def test_release_clears_ownership_before_reentrant_stop(self):
+        owner = recording.TimelinePlaybackOwner()
+        calls = []
+        state = {"playing": False}
+
+        def start():
+            state["playing"] = True
+
+        def stop():
+            calls.append("stop")
+            self.assertFalse(owner.owns_playback)
+            self.assertFalse(owner.release())
+            state["playing"] = False
+
+        owner.acquire(lambda: state["playing"], start, stop)
+        self.assertTrue(owner.release())
+        self.assertEqual(calls, ["stop"])
+
+    def test_start_failure_does_not_claim_playback(self):
+        owner = recording.TimelinePlaybackOwner()
+
+        def fail_start():
+            raise RuntimeError("injected start failure")
+
+        with self.assertRaisesRegex(RuntimeError, "injected start failure"):
+            owner.acquire(lambda: False, fail_start, lambda: None)
+        self.assertFalse(owner.owns_playback)
+        self.assertFalse(owner.release())
+
+    def test_manual_stop_before_release_does_not_issue_duplicate_stop(self):
+        owner = recording.TimelinePlaybackOwner()
+        state = {"playing": False}
+        calls = []
+
+        def start():
+            state["playing"] = True
+
+        owner.acquire(
+            lambda: state["playing"],
+            start,
+            lambda: calls.append("stop"),
+        )
+        state["playing"] = False
+        self.assertTrue(owner.release())
+        self.assertEqual(calls, [])
+
 
 class RuntimeMetadataTests(unittest.TestCase):
     def metadata(self):

@@ -28,6 +28,7 @@ from .collision_cache import (
 )
 from . recording import (
     MarioRuntimeMetadata, RUNTIME_METADATA_SCHEMA_VERSION, recorder,
+    timeline_playback,
 )
 from .audio_runtime import AudioBackendError, LiveAudioRuntime
 
@@ -872,6 +873,18 @@ last_cam_change_tick = -30
 
 def _lifecycle_log(session, message):
     print("libsm64 lifecycle [{}] {}".format(session.generation, message))
+
+
+def _release_recording_timeline_playback(session=None):
+    """Release playback started for recording without disrupting cleanup."""
+    try:
+        return timeline_playback.release()
+    except Exception as exc:
+        _lifecycle_log(
+            session or _lifecycle,
+            "timeline playback cleanup failed: {}".format(exc),
+        )
+        return False
 
 
 def _native_call(session, export_name, *arguments):
@@ -2209,6 +2222,7 @@ def remove_tick_mario_timer(session=None):
 
 
 def _poison_session(session, message):
+    _release_recording_timeline_playback(session)
     session.control_state = POISONED
     session.last_error = str(message)
     remove_tick_mario_timer(session)
@@ -3629,6 +3643,7 @@ def begin_mario_recording(scene, reset_to_mark=False):
         session.control_state = RECORDING
         _install_tick_timer(session)
     except Exception:
+        _release_recording_timeline_playback(session)
         recorder.cancel("Recording did not start")
         session.recording_tick_origin = None
         if session.control_state != POISONED and is_mario_running():
@@ -3640,6 +3655,7 @@ def freeze_mario_recording_for_bake():
     session = _lifecycle
     if session.control_state != RECORDING and not recorder.has_pending_samples:
         raise RecordingError("Live Mario is not recording")
+    _release_recording_timeline_playback(session)
     try:
         samples = recorder.freeze_for_bake()
     except Exception:
@@ -3669,6 +3685,7 @@ def resume_live_idle_after_transition(mark):
 def return_to_start_mark_after_transition():
     """Return to a valid Start Mark and resume controllable idle operation."""
     session = _lifecycle
+    _release_recording_timeline_playback(session)
     valid_mark = has_valid_start_mark()
     if recorder.active:
         raise RuntimeError("Cannot finish the recording transition while capture is active")
@@ -3686,6 +3703,7 @@ def return_to_start_mark_after_transition():
 def abandon_bake_transition():
     """Return a safe session to idle while retaining recorder error samples."""
     session = _lifecycle
+    _release_recording_timeline_playback(session)
     if is_mario_running() and session.control_state != POISONED:
         session.control_state = LIVE_IDLE
         _install_tick_timer(session)
@@ -3697,6 +3715,7 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
     global original_fps_base, original_cursor_pos, simulation_scene
 
     session = _session or _lifecycle
+    _release_recording_timeline_playback(session)
     if session.shutdown_in_progress:
         _lifecycle_log(session, "shutdown already in progress")
         return ()
@@ -4008,6 +4027,7 @@ def tick_mario(scene, depsgraph=None, _session=None):
         )
     except Exception as exc:
         recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
+        _release_recording_timeline_playback(session)
         if session.control_state == RECORDING:
             session.control_state = LIVE_IDLE
     tick_count += 1
