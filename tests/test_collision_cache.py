@@ -29,6 +29,21 @@ def normal(triangle):
 
 
 class CollisionSpatialTests(unittest.TestCase):
+    def test_collision_roles_default_static_and_are_explicit(self):
+        class FakeObject(dict):
+            pass
+
+        default = FakeObject()
+        self.assertEqual(collision.collision_role(default), collision.COLLISION_ROLE_STATIC)
+        default[collision.COLLISION_ROLE_PROPERTY] = collision.COLLISION_ROLE_MOVING_PLATFORM
+        self.assertEqual(
+            collision.collision_role(default), collision.COLLISION_ROLE_MOVING_PLATFORM
+        )
+        default[collision.COLLISION_ROLE_PROPERTY] = collision.COLLISION_ROLE_EXCLUDED
+        self.assertEqual(collision.collision_role(default), collision.COLLISION_ROLE_EXCLUDED)
+        default[collision.COLLISION_ROLE_PROPERTY] = "INVALID"
+        self.assertEqual(collision.collision_role(default), collision.COLLISION_ROLE_STATIC)
+
     def test_chunk_coordinates_and_negative_space(self):
         self.assertEqual(collision.chunk_coordinate((0.0, 255.9, 99.0)), (0, 0))
         self.assertEqual(collision.chunk_coordinate((-0.01, -256.0, 0.0)), (-1, -1))

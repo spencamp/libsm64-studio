@@ -46,7 +46,16 @@ class FakeLibrary:
         self.sm64_mario_create = NativeCall(mario_id, name="mario_create", events=self.events)
         self.sm64_mario_delete = NativeCall(name="mario_delete", events=self.events)
         self.sm64_mario_tick = NativeCall()
+        self.sm64_set_mario_action = NativeCall()
+        self.sm64_set_mario_animation = NativeCall()
+        self.sm64_set_mario_anim_frame = NativeCall()
+        self.sm64_set_mario_state = NativeCall()
+        self.sm64_set_mario_position = NativeCall()
         self.sm64_set_mario_faceangle = NativeCall()
+        self.sm64_set_mario_velocity = NativeCall()
+        self.sm64_set_mario_forward_velocity = NativeCall()
+        self.sm64_set_mario_health = NativeCall()
+        self.sm64_set_mario_invincibility = NativeCall()
         self.sm64_surface_object_create = NativeCall(100)
         self.sm64_surface_object_move = NativeCall()
         self.sm64_surface_object_delete = NativeCall()
@@ -111,10 +120,10 @@ assert not recorder.active and recorder.sample_count == 0
 # not replace it.
 mario.mario_state.position[:] = (123.25, 456.5, -78.75)
 mark = mario.set_persistent_start_mark()
-assert mark["position"] == (123.25, 456.5, -78.75)
+assert mark.position == (123.25, 456.5, -78.75)
 mario.mario_state.position[0] = 321.0
 mario.begin_mario_recording(scene)
-assert mario._valid_persistent_start_mark()["position"] == (123.25, 456.5, -78.75)
+assert mario._valid_persistent_start_mark().position == (123.25, 456.5, -78.75)
 assert recorder.start_frame == 41.0
 assert math.isclose(
     recorder.target_fps,

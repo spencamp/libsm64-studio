@@ -77,7 +77,7 @@ sample = PerformanceSample((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0)
 try:
     addon.freeze_mario_recording_for_bake = lambda: (sample,)
     addon.bake_shape_keys = lambda *_args: SimpleNamespace(name="Baked")
-    addon.register_baked_take = lambda _scene, _obj: 1
+    addon.register_baked_take = lambda _scene, _obj, runtime_samples=None: 1
     addon.select_take = lambda *_args: None
     addon.return_to_start_mark_after_transition = lambda: transitions.append("resume")
     addon.recorder.samples = [sample]

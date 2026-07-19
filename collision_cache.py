@@ -12,7 +12,7 @@ import struct
 import time
 
 
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 COORDINATE_MAPPING_VERSION = 2
 CHUNK_SIZE_BLENDER = 256.0
 PRELOAD_RADIUS = 1
@@ -22,6 +22,26 @@ BOUNDARY_EPSILON = 1.0e-7
 DEGENERATE_EPSILON_SQUARED = 1.0e-16
 INT32_MIN = -0x80000000
 INT32_MAX = 0x7FFFFFFF
+COLLISION_ROLE_PROPERTY = "libsm64_collision_role"
+COLLISION_ROLE_STATIC = "STATIC"
+COLLISION_ROLE_MOVING_PLATFORM = "MOVING_PLATFORM"
+COLLISION_ROLE_EXCLUDED = "EXCLUDED"
+COLLISION_ROLES = (
+    COLLISION_ROLE_STATIC,
+    COLLISION_ROLE_MOVING_PLATFORM,
+    COLLISION_ROLE_EXCLUDED,
+)
+
+
+def collision_role(obj):
+    """Return the explicit Studio collision role, defaulting safely to Static."""
+    role = getattr(obj, COLLISION_ROLE_PROPERTY, None)
+    if role not in COLLISION_ROLES:
+        try:
+            role = obj.get(COLLISION_ROLE_PROPERTY, COLLISION_ROLE_STATIC)
+        except Exception:
+            role = COLLISION_ROLE_STATIC
+    return role if role in COLLISION_ROLES else COLLISION_ROLE_STATIC
 
 
 def _finite_values(values):
@@ -298,6 +318,8 @@ class CollisionCache:
             if getattr(obj, "type", None) != "MESH":
                 continue
             if obj.get("libsm64_is_bake", False) or obj.get("libsm64_live_role", ""):
+                continue
+            if collision_role(obj) != COLLISION_ROLE_STATIC:
                 continue
             try:
                 hidden = obj.hide_get()

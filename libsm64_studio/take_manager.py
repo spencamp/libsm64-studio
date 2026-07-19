@@ -11,6 +11,7 @@ SCENE_CURRENT_TAKE = "libsm64_current_take_id"
 SCENE_NEXT_TAKE = "libsm64_next_take_number"
 SCENE_SCHEMA_VERSION = "libsm64_take_schema_version"
 TAKE_SCHEMA_VERSION = 2
+RUNTIME_METADATA_TEXT_PROPERTY = "libsm64_runtime_metadata_text"
 
 REGULAR = "REGULAR"
 FAVORITE = "FAVORITE"
@@ -159,7 +160,7 @@ def _restore_property(owner, key, snapshot):
         del owner[key]
 
 
-def register_baked_take(scene, obj):
+def register_baked_take(scene, obj, runtime_samples=None):
     """Commit one already-built take without rewriting any earlier take."""
     mesh = getattr(obj, "data", None)
     if mesh is None:
@@ -174,7 +175,13 @@ def register_baked_take(scene, obj):
         apply_visibility(scene)
         return number
 
-    from .recording import validate_take_ownership
+    from .recording import (
+        RecordingError,
+        create_take_runtime_metadata_text,
+        remove_take_runtime_metadata_text,
+        validate_take_ownership,
+        validate_take_runtime_metadata,
+    )
     mesh, key_data, pose_action, transform_action = validate_take_ownership(
         obj, require_schema_2=True
     )
@@ -196,7 +203,9 @@ def register_baked_take(scene, obj):
     prior_names = (
         obj.name, mesh.name, key_data.name, transform_action.name, pose_action.name
     )
-    object_property_keys = (TAKE_ID, TAKE_NUMBER, TAKE_DISPOSITION)
+    object_property_keys = (
+        TAKE_ID, TAKE_NUMBER, TAKE_DISPOSITION, RUNTIME_METADATA_TEXT_PROPERTY,
+    )
     prior_object_properties = {
         key: _property_snapshot(obj, key) for key in object_property_keys
     }
@@ -205,6 +214,7 @@ def register_baked_take(scene, obj):
         (datablock, _property_snapshot(datablock, TAKE_OWNER))
         for datablock in owned_datablocks
     ]
+    runtime_text = None
     try:
         obj[TAKE_ID] = take_id
         obj[TAKE_NUMBER] = number
@@ -217,16 +227,41 @@ def register_baked_take(scene, obj):
         for datablock in owned_datablocks:
             _mark_owned(datablock, take_id)
 
+        if runtime_samples is not None:
+            runtime_text = create_take_runtime_metadata_text(
+                obj,
+                runtime_samples,
+                take_id,
+                number,
+                float(obj.get("libsm64_recording_start_frame", 0.0)),
+                float(obj.get("libsm64_target_fps", 0.0)),
+            )
+
         # Ownership and metadata are complete before any earlier take is hidden.
         validate_take_ownership(obj, require_schema_2=True)
         if any(datablock.get(TAKE_OWNER) != take_id for datablock in owned_datablocks):
             raise TakeError("The new take ownership transaction did not commit all datablocks")
+        if runtime_samples is not None:
+            validated_runtime = validate_take_runtime_metadata(
+                obj, expected_take_id=take_id
+            )
+            if (
+                validated_runtime is None
+                or validated_runtime["text"] is not runtime_text
+                or runtime_text.get(TAKE_OWNER) != take_id
+            ):
+                raise TakeError("The new take runtime metadata ownership did not commit")
         scene[SCENE_NEXT_TAKE] = number + 1
         scene[SCENE_CURRENT_TAKE] = take_id
         scene[SCENE_SCHEMA_VERSION] = TAKE_SCHEMA_VERSION
         apply_visibility(scene)
         return number
     except Exception:
+        if runtime_text is not None:
+            try:
+                remove_take_runtime_metadata_text(obj, expected_take_id=take_id)
+            except RecordingError:
+                pass
         for key, snapshot in prior_object_properties.items():
             _restore_property(obj, key, snapshot)
         for datablock, snapshot in prior_owners:
@@ -252,6 +287,18 @@ def register_baked_take(scene, obj):
         except (AttributeError, RuntimeError):
             obj.hide_viewport = prior_candidate_visibility[1]
         raise
+
+
+def runtime_metadata_for_take(obj):
+    """Return validated persisted metadata, or None for a compatible legacy take."""
+    from .recording import RecordingError, validate_take_runtime_metadata
+
+    if not is_take(obj):
+        raise TakeError("Runtime metadata requires a registered baked take")
+    try:
+        return validate_take_runtime_metadata(obj)
+    except RecordingError as exc:
+        raise TakeError(str(exc)) from exc
 
 
 def select_take(context, obj):
@@ -303,6 +350,7 @@ def restore_take(context, obj):
 def cleanup_rejected(scene=None):
     """Delete rejected objects and only datablocks proven to be take-owned."""
     import bpy
+    from .recording import RecordingError, remove_take_runtime_metadata_text
 
     rejected = [obj for obj in iter_takes() if obj.get(TAKE_DISPOSITION) == REJECTED]
     removed = 0
@@ -314,6 +362,11 @@ def cleanup_rejected(scene=None):
         pose_action = getattr(pose_animation, "action", None)
         object_animation = getattr(obj, "animation_data", None)
         transform_action = getattr(object_animation, "action", None)
+        try:
+            remove_take_runtime_metadata_text(obj, expected_take_id=take_id)
+        except RecordingError:
+            # Never delete a Text whose exclusive take ownership is uncertain.
+            pass
         bpy.data.objects.remove(obj, do_unlink=True)
         if mesh is not None and mesh.get(TAKE_OWNER) == take_id and mesh.users == 0:
             bpy.data.meshes.remove(mesh)

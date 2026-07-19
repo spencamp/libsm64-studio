@@ -91,14 +91,23 @@ class PackageImportContractTests(unittest.TestCase):
             owners = []
             for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
                 if any(
-                    isinstance(node, ast.Attribute)
-                    and node.attr == "sm64_static_surfaces_load"
+                    (
+                        isinstance(node, ast.Attribute)
+                        and node.attr == "sm64_static_surfaces_load"
+                    ) or (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "_native_call"
+                        and len(node.args) >= 2
+                        and isinstance(node.args[1], ast.Constant)
+                        and node.args[1].value == "sm64_static_surfaces_load"
+                    )
                     for node in ast.walk(function)
                 ):
                     owners.append(function.name)
             self.assertEqual(owners, ["_configure_native_api", "insert_mario"])
             source = (base / "mario.py").read_text(encoding="utf-8")
-            self.assertIn("sm64_static_surfaces_load(empty_surfaces, 0)", source)
+            self.assertIn('session, "sm64_static_surfaces_load", empty_surfaces, 0', source)
 
     def test_start_mark_api_is_explicit_and_recording_does_not_capture_it(self):
         mario_tree = ast.parse((PACKAGE / "mario.py").read_text(encoding="utf-8"))

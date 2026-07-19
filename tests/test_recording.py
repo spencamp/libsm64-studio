@@ -1,4 +1,5 @@
 from array import array
+from dataclasses import FrozenInstanceError
 import importlib.util
 import math
 from pathlib import Path
@@ -37,6 +38,80 @@ class FrameMappingTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     recording.sample_target_frame(10, 3, target_fps), target_frame
                 )
+
+    def test_held_runtime_mapping_at_24_30_60_and_fractional_frames(self):
+        cases = (
+            (24.0, 10.7999, 0),
+            (24.0, 10.8, 1),
+            (24.0, 11.5999, 1),
+            (30.0, 11.9999, 1),
+            (30.0, 12.0, 2),
+            (60.0, 13.9999, 1),
+            (60.0, 14.0, 2),
+        )
+        for target_fps, frame, expected in cases:
+            with self.subTest(target_fps=target_fps, frame=frame):
+                self.assertEqual(
+                    recording.held_runtime_sample_index(
+                        frame, 10.0, target_fps, 4
+                    ),
+                    expected,
+                )
+        self.assertEqual(recording.held_runtime_sample_index(-100, 10, 30, 4), 0)
+        self.assertEqual(recording.held_runtime_sample_index(100, 10, 30, 4), 3)
+
+
+class RuntimeMetadataTests(unittest.TestCase):
+    def metadata(self):
+        return recording.MarioRuntimeMetadata(
+            native_position=(1.25, -2.5, 3.75),
+            native_velocity=(-4.5, 5.25, -6.75),
+            face_angle=3.125,
+            forward_velocity=-12.5,
+            health=0x880,
+            action=0xFFFFFFFF,
+            animation_id=-2147483648,
+            animation_frame=-32768,
+            flags=0xFEDCBA98,
+            particle_flags=0x89ABCDEF,
+            invincibility_timer=32767,
+        )
+
+    def test_immutable_exact_round_trip(self):
+        metadata = self.metadata()
+        with self.assertRaises(FrozenInstanceError):
+            metadata.action = 0
+        record = metadata.to_json_record()
+        restored = recording.MarioRuntimeMetadata.from_json_record(record)
+        self.assertEqual(restored, metadata)
+        self.assertEqual(restored.action, 0xFFFFFFFF)
+        self.assertEqual(restored.animation_id, -2147483648)
+        self.assertEqual(restored.particle_flags, 0x89ABCDEF)
+
+    def test_float_and_integer_validation(self):
+        base = self.metadata().to_json_record()
+        for field, value in (
+            ("native_position", (1.0, 2.0)),
+            ("native_velocity", (1.0, math.nan, 3.0)),
+            ("face_angle", math.inf),
+            ("forward_velocity", -math.inf),
+            ("action", -1),
+            ("flags", 0x100000000),
+            ("animation_frame", 32768),
+            ("health", True),
+        ):
+            malformed = dict(base)
+            malformed[field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(recording.RecordingError):
+                    recording.MarioRuntimeMetadata.from_json_record(malformed)
+
+    def test_performance_sample_owns_same_tick_metadata(self):
+        metadata = self.metadata()
+        sample = recording.PerformanceSample(
+            array('f', [0.0, 1.0, 2.0]), (4.0, 5.0, 6.0), 0.5, metadata
+        )
+        self.assertIs(sample.runtime_metadata, metadata)
 
 
 class TransformMathTests(unittest.TestCase):

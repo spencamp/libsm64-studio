@@ -6,6 +6,8 @@ behind :func:`bake_shape_keys`.
 """
 
 from array import array
+from dataclasses import dataclass
+import json
 import math
 
 
@@ -15,6 +17,10 @@ BAKE_SCHEMA_VERSION = "libsm64_bake_schema_version"
 BAKE_LAYOUT = "libsm64_bake_layout"
 CURRENT_BAKE_SCHEMA_VERSION = 2
 OBJECT_MOTION_LOCAL_POSE = "OBJECT_MOTION_LOCAL_POSE"
+RUNTIME_METADATA_SCHEMA_VERSION = 1
+RUNTIME_METADATA_TEXT_PROPERTY = "libsm64_runtime_metadata_text"
+RUNTIME_METADATA_OWNER_PROPERTY = "libsm64_take_owner"
+RUNTIME_METADATA_SCHEMA_PROPERTY = "libsm64_runtime_metadata_schema"
 
 
 class RecordingError(RuntimeError):
@@ -65,24 +71,126 @@ def _validate_face_angle(face_angle):
     return value
 
 
+def _validate_int(name, value, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecordingError("{} must be an integer".format(name))
+    if value < minimum or value > maximum:
+        raise RecordingError(
+            "{} must be between {} and {}".format(name, minimum, maximum)
+        )
+    return value
+
+
+def _validate_float3(name, value):
+    try:
+        values = tuple(float(component) for component in value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RecordingError("{} must contain three finite values".format(name)) from exc
+    if len(values) != 3 or any(not math.isfinite(component) for component in values):
+        raise RecordingError("{} must contain three finite values".format(name))
+    return values
+
+
+@dataclass(frozen=True)
+class MarioRuntimeMetadata:
+    """Immutable public libsm64 state captured from one geometry-producing tick."""
+
+    native_position: tuple
+    native_velocity: tuple
+    face_angle: float
+    forward_velocity: float
+    health: int
+    action: int
+    animation_id: int
+    animation_frame: int
+    flags: int
+    particle_flags: int
+    invincibility_timer: int
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "native_position", _validate_float3("native_position", self.native_position)
+        )
+        object.__setattr__(
+            self, "native_velocity", _validate_float3("native_velocity", self.native_velocity)
+        )
+        object.__setattr__(self, "face_angle", _validate_face_angle(self.face_angle))
+        try:
+            forward_velocity = float(self.forward_velocity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RecordingError("forward_velocity must be finite") from exc
+        if not math.isfinite(forward_velocity):
+            raise RecordingError("forward_velocity must be finite")
+        object.__setattr__(self, "forward_velocity", forward_velocity)
+        _validate_int("health", self.health, -0x8000, 0x7FFF)
+        _validate_int("action", self.action, 0, 0xFFFFFFFF)
+        _validate_int("animation_id", self.animation_id, -0x80000000, 0x7FFFFFFF)
+        _validate_int("animation_frame", self.animation_frame, -0x8000, 0x7FFF)
+        _validate_int("flags", self.flags, 0, 0xFFFFFFFF)
+        _validate_int("particle_flags", self.particle_flags, 0, 0xFFFFFFFF)
+        _validate_int(
+            "invincibility_timer", self.invincibility_timer, -0x8000, 0x7FFF
+        )
+
+    def to_json_record(self):
+        return {
+            "native_position": list(self.native_position),
+            "native_velocity": list(self.native_velocity),
+            "face_angle": self.face_angle,
+            "forward_velocity": self.forward_velocity,
+            "health": self.health,
+            "action": self.action,
+            "animation_id": self.animation_id,
+            "animation_frame": self.animation_frame,
+            "flags": self.flags,
+            "particle_flags": self.particle_flags,
+            "invincibility_timer": self.invincibility_timer,
+        }
+
+    @classmethod
+    def from_json_record(cls, record):
+        if not isinstance(record, dict):
+            raise RecordingError("Runtime metadata sample must be a JSON object")
+        fields = (
+            "native_position", "native_velocity", "face_angle", "forward_velocity",
+            "health", "action", "animation_id", "animation_frame", "flags",
+            "particle_flags", "invincibility_timer",
+        )
+        missing = [name for name in fields if name not in record]
+        if missing:
+            raise RecordingError(
+                "Runtime metadata sample is missing: {}".format(", ".join(missing))
+            )
+        return cls(**{name: record[name] for name in fields})
+
+
 class PerformanceSample:
     """One immutable-transform, fixed-topology performance snapshot."""
 
-    __slots__ = ("_coordinates", "_world_location", "_face_angle")
+    __slots__ = ("_coordinates", "_world_location", "_face_angle", "_runtime_metadata")
 
-    def __init__(self, coordinates, world_location, face_angle):
+    def __init__(self, coordinates, world_location, face_angle, runtime_metadata=None):
         self._coordinates = _copy_coordinates(coordinates)
         self._world_location = _validate_world_location(world_location)
         self._face_angle = _validate_face_angle(face_angle)
+        if runtime_metadata is not None and not isinstance(
+                runtime_metadata, MarioRuntimeMetadata):
+            raise RecordingError("Runtime metadata must be a MarioRuntimeMetadata record")
+        self._runtime_metadata = runtime_metadata
 
     @classmethod
-    def _from_owned_coordinates(cls, coordinates, world_location, face_angle):
+    def _from_owned_coordinates(
+            cls, coordinates, world_location, face_angle, runtime_metadata=None):
         """Build from a fresh recorder buffer without making a second copy."""
         _validate_coordinates(coordinates)
         instance = cls.__new__(cls)
         instance._coordinates = coordinates
         instance._world_location = _validate_world_location(world_location)
         instance._face_angle = _validate_face_angle(face_angle)
+        if runtime_metadata is not None and not isinstance(
+                runtime_metadata, MarioRuntimeMetadata):
+            raise RecordingError("Runtime metadata must be a MarioRuntimeMetadata record")
+        instance._runtime_metadata = runtime_metadata
         return instance
 
     @property
@@ -96,6 +204,10 @@ class PerformanceSample:
     @property
     def face_angle(self):
         return self._face_angle
+
+    @property
+    def runtime_metadata(self):
+        return self._runtime_metadata
 
 
 def validate_performance_sample(sample, expected_values=None):
@@ -169,6 +281,218 @@ def sample_target_frame(start_frame, sample_index, target_fps, sample_fps=SAMPLE
     return float(start_frame) + float(sample_index) * float(target_fps) / float(sample_fps)
 
 
+def held_runtime_sample_index(
+        frame, start_frame, target_fps, sample_count, sample_fps=SAMPLE_FPS):
+    """Map a Blender frame to the constant-held runtime sample used by playback."""
+    frame = float(frame)
+    start_frame = float(start_frame)
+    target_fps = float(target_fps)
+    sample_fps = float(sample_fps)
+    if not all(math.isfinite(value) for value in (
+            frame, start_frame, target_fps, sample_fps)):
+        raise ValueError("Frame mapping values must be finite")
+    if target_fps <= 0.0 or sample_fps <= 0.0:
+        raise ValueError("Frame rates must be positive")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise ValueError("sample_count must be an integer")
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    relative_sample = (frame - start_frame) * sample_fps / target_fps
+    held = int(math.floor(relative_sample + 1.0e-9))
+    return min(sample_count - 1, max(0, held))
+
+
+def _runtime_metadata_document(samples, start_frame, target_fps, take_id):
+    if not isinstance(take_id, str) or not take_id:
+        raise RecordingError("Runtime metadata requires a take owner ID")
+    metadata = []
+    for index, sample in enumerate(samples):
+        validate_performance_sample(sample)
+        if sample.runtime_metadata is None:
+            raise RecordingError(
+                "Sample {} has no same-tick Mario runtime metadata".format(index)
+            )
+        metadata.append(sample.runtime_metadata.to_json_record())
+    if not metadata:
+        raise RecordingError("Runtime metadata requires at least one sample")
+    start_frame = float(start_frame)
+    target_fps = float(target_fps)
+    if not math.isfinite(start_frame) or not math.isfinite(target_fps) or target_fps <= 0:
+        raise RecordingError("Runtime metadata frame mapping is invalid")
+    sample_frames = [
+        sample_target_frame(start_frame, index, target_fps)
+        for index in range(len(metadata))
+    ]
+    return {
+        "schema_version": RUNTIME_METADATA_SCHEMA_VERSION,
+        "sample_rate": SAMPLE_FPS,
+        "target_fps": target_fps,
+        "sample_count": len(metadata),
+        "sample_to_frame_mapping": {
+            "mode": "constant_hold",
+            "start_frame": start_frame,
+            "sample_frames": sample_frames,
+        },
+        "coordinate_conventions": {
+            "native_axes": "libsm64 X/Y(up)/Z",
+            "blender_axes": "Blender X/native X, Blender Z/native Y, -Blender Y/native Z",
+            "native_position_units": "libsm64 units relative to the recording session origin",
+            "angles": "radians",
+            "metadata_effect": "inspection_only; geometry playback remains authoritative",
+        },
+        "source_take_owner_id": take_id,
+        "samples": metadata,
+    }
+
+
+def create_take_runtime_metadata_text(
+        baked_object, samples, take_id, take_number, start_frame, target_fps):
+    """Create one exclusively referenced, compact JSON Text datablock."""
+    import bpy
+
+    if baked_object.get(RUNTIME_METADATA_TEXT_PROPERTY):
+        raise RecordingError("The candidate take already references runtime metadata")
+    document = _runtime_metadata_document(
+        samples, start_frame, target_fps, take_id
+    )
+    text = bpy.data.texts.new(
+        "LibSM64 Studio Take {:03d} Runtime Metadata".format(int(take_number))
+    )
+    try:
+        text[RUNTIME_METADATA_OWNER_PROPERTY] = take_id
+        text[RUNTIME_METADATA_SCHEMA_PROPERTY] = RUNTIME_METADATA_SCHEMA_VERSION
+        text.write(json.dumps(
+            document, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ))
+        baked_object[RUNTIME_METADATA_TEXT_PROPERTY] = text.name
+        validate_take_runtime_metadata(baked_object, expected_take_id=take_id)
+        return text
+    except Exception:
+        if baked_object.get(RUNTIME_METADATA_TEXT_PROPERTY) == text.name:
+            del baked_object[RUNTIME_METADATA_TEXT_PROPERTY]
+        if bpy.data.texts.get(text.name) is text:
+            bpy.data.texts.remove(text)
+        raise
+
+
+def take_runtime_metadata_text(baked_object, require=False):
+    """Resolve one take's exclusive Text reference without needing native runtime."""
+    import bpy
+
+    name = baked_object.get(RUNTIME_METADATA_TEXT_PROPERTY, "")
+    if not name:
+        if require:
+            raise RecordingError("This take has no runtime metadata Text datablock")
+        return None
+    text = bpy.data.texts.get(name)
+    if text is None:
+        if require:
+            raise RecordingError("The take's runtime metadata Text datablock is missing")
+        return None
+    references = [
+        obj for obj in bpy.data.objects
+        if obj.get(RUNTIME_METADATA_TEXT_PROPERTY, "") == text.name
+    ]
+    if len(references) != 1 or references[0] is not baked_object:
+        raise RecordingError("Runtime metadata Text ownership is not exclusive")
+    return text
+
+
+def validate_take_runtime_metadata(baked_object, expected_take_id=None):
+    """Parse and validate one persisted runtime document; legacy takes return None."""
+    text = take_runtime_metadata_text(baked_object, require=False)
+    if text is None:
+        return None
+    take_id = expected_take_id or baked_object.get("libsm64_take_id", "")
+    if not take_id:
+        raise RecordingError("Runtime metadata owner cannot be validated")
+    if text.get(RUNTIME_METADATA_OWNER_PROPERTY) != take_id:
+        raise RecordingError("Runtime metadata Text owner does not match the take")
+    try:
+        document = json.loads(text.as_string())
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RecordingError("Runtime metadata Text is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise RecordingError("Runtime metadata document must be a JSON object")
+    if document.get("schema_version") != RUNTIME_METADATA_SCHEMA_VERSION:
+        raise RecordingError("Unsupported runtime metadata schema")
+    if document.get("source_take_owner_id") != take_id:
+        raise RecordingError("Runtime metadata document owner does not match the take")
+    sample_count = document.get("sample_count")
+    _validate_int("sample_count", sample_count, 1, 0x7FFFFFFF)
+    samples = document.get("samples")
+    if not isinstance(samples, list) or len(samples) != sample_count:
+        raise RecordingError("Runtime metadata sample count is inconsistent")
+    parsed_samples = tuple(
+        MarioRuntimeMetadata.from_json_record(sample) for sample in samples
+    )
+    sample_rate = float(document.get("sample_rate", 0.0))
+    target_fps = float(document.get("target_fps", 0.0))
+    mapping = document.get("sample_to_frame_mapping")
+    if (
+        not math.isfinite(sample_rate) or sample_rate <= 0.0
+        or not math.isfinite(target_fps) or target_fps <= 0.0
+        or not isinstance(mapping, dict)
+        or mapping.get("mode") != "constant_hold"
+    ):
+        raise RecordingError("Runtime metadata timing is invalid")
+    start_frame = float(mapping.get("start_frame", float("nan")))
+    frames = mapping.get("sample_frames")
+    expected_frames = [
+        sample_target_frame(start_frame, index, target_fps, sample_rate)
+        for index in range(sample_count)
+    ] if math.isfinite(start_frame) else []
+    if (
+        not math.isfinite(start_frame)
+        or not isinstance(frames, list)
+        or len(frames) != sample_count
+        or any(
+            not math.isclose(float(actual), expected, rel_tol=0.0, abs_tol=1.0e-9)
+            for actual, expected in zip(frames, expected_frames)
+        )
+    ):
+        raise RecordingError("Runtime metadata sample-to-frame mapping is invalid")
+    return {
+        "document": document,
+        "samples": parsed_samples,
+        "sample_rate": sample_rate,
+        "target_fps": target_fps,
+        "start_frame": start_frame,
+        "text": text,
+    }
+
+
+def runtime_metadata_at_frame(baked_object, frame):
+    validated = validate_take_runtime_metadata(baked_object)
+    if validated is None:
+        return None
+    index = held_runtime_sample_index(
+        frame,
+        validated["start_frame"],
+        validated["target_fps"],
+        len(validated["samples"]),
+        validated["sample_rate"],
+    )
+    return index, validated["samples"][index], validated
+
+
+def remove_take_runtime_metadata_text(baked_object, expected_take_id=None):
+    """Delete only an exclusively referenced Text proven to belong to this take."""
+    import bpy
+
+    text = take_runtime_metadata_text(baked_object, require=False)
+    if text is None:
+        return False
+    take_id = expected_take_id or baked_object.get("libsm64_take_id", "")
+    if not take_id or text.get(RUNTIME_METADATA_OWNER_PROPERTY) != take_id:
+        return False
+    if RUNTIME_METADATA_TEXT_PROPERTY in baked_object:
+        del baked_object[RUNTIME_METADATA_TEXT_PROPERTY]
+    if bpy.data.texts.get(text.name) is text:
+        bpy.data.texts.remove(text)
+    return True
+
+
 class GeometryRecorder:
     """Owns one pending recording without depending on Blender types."""
 
@@ -214,7 +538,8 @@ class GeometryRecorder:
         self.status = self.RECORDING
         self.message = "Capturing one mesh snapshot per libsm64 tick"
 
-    def capture_mesh(self, mesh, sample_id, world_location, face_angle):
+    def capture_mesh(
+            self, mesh, sample_id, world_location, face_angle, runtime_metadata=None):
         """Capture geometry and same-tick Mario transform metadata."""
         if not self.active:
             return False
@@ -230,7 +555,7 @@ class GeometryRecorder:
         mesh.vertices.foreach_get("co", coordinates)
         try:
             sample = PerformanceSample._from_owned_coordinates(
-                coordinates, world_location, face_angle
+                coordinates, world_location, face_angle, runtime_metadata
             )
         except RecordingError as exc:
             self.fail(str(exc), preserve_samples=True)
@@ -338,6 +663,7 @@ def _remove_take_datablocks(
 
 def discard_baked_take(baked_object):
     """Roll back a fully built but uncommitted baked take."""
+    remove_take_runtime_metadata_text(baked_object)
     mesh = getattr(baked_object, "data", None)
     key_data = getattr(mesh, "shape_keys", None) if mesh is not None else None
     pose_animation = getattr(key_data, "animation_data", None)

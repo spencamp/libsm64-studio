@@ -8,17 +8,32 @@ import platform
 import ctypes as ct
 import math
 import mathutils
+import struct
+import threading
+import time
 import uuid
+from collections import deque
 from typing import cast, List
 from . collision_types import COLLISION_TYPES
 from .collision_cache import (
     CHUNK_SIZE_BLENDER,
+    COLLISION_ROLE_EXCLUDED as _COLLISION_ROLE_EXCLUDED,
+    COLLISION_ROLE_MOVING_PLATFORM as _COLLISION_ROLE_MOVING_PLATFORM,
+    COLLISION_ROLE_STATIC as _COLLISION_ROLE_STATIC,
     CollisionCache,
+    collision_role,
     chunk_coordinate,
     native_chunk_payload,
     plan_transition,
 )
-from . recording import recorder
+from . recording import (
+    MarioRuntimeMetadata, RUNTIME_METADATA_SCHEMA_VERSION, recorder,
+)
+from .audio_runtime import AudioBackendError, LiveAudioRuntime
+
+COLLISION_ROLE_STATIC = _COLLISION_ROLE_STATIC
+COLLISION_ROLE_MOVING_PLATFORM = _COLLISION_ROLE_MOVING_PLATFORM
+COLLISION_ROLE_EXCLUDED = _COLLISION_ROLE_EXCLUDED
 
 if platform.system() == 'Windows':
     from . input_reader_win import (
@@ -41,6 +56,28 @@ SIMULATION_FPS = 30.0
 SIMULATION_INTERVAL = 1.0 / SIMULATION_FPS
 PINNED_LIBSM64_COMMIT = "fd11813208272b4271d92bd92feb8f3fdbe61be5"
 NATIVE_STAGE_PREFIX = "LIBSM64_NATIVE_STAGE"
+START_MARK_SCHEMA_VERSION = 1
+START_MARK_SAFE = "SAFE"
+START_MARK_PERFORMANCE = "PERFORMANCE"
+START_MARK_RESTORATION_MODES = (START_MARK_SAFE, START_MARK_PERFORMANCE)
+START_MARK_OBSERVED_ONLY_FIELDS = ("particle_flags",)
+ENVIRONMENT_WATER = "water"
+ENVIRONMENT_GAS = "gas"
+ENVIRONMENT_LEVEL_KINDS = (ENVIRONMENT_WATER, ENVIRONMENT_GAS)
+# The pinned decomp's find_water_level() and find_poison_gas_level() both
+# return -10000.0f when no environment region is present.  The public setters
+# accept signed int levels, so this is the exact canonical disabled value.
+ENVIRONMENT_DISABLED_NATIVE_LEVEL = -10000
+# Exact src/decomp/include/sm64.h values at PINNED_LIBSM64_COMMIT.
+MARIO_VANISH_CAP = 0x00000002
+MARIO_METAL_CAP = 0x00000004
+MARIO_WING_CAP = 0x00000008
+SUPPORTED_CAP_FLAGS = (MARIO_WING_CAP, MARIO_METAL_CAP, MARIO_VANISH_CAP)
+CAP_REQUEST_HISTORY_LIMIT = 32
+AUDIO_SOUND_EVENT_HISTORY_LIMIT = 256
+NATIVE_DEBUG_LOG_LIMIT = 256
+# Exact FLOOR_LOWER_LIMIT from the pinned decomp's surface_collision.h.
+NO_FLOOR_NATIVE_HEIGHT = -110000.0
 
 STOPPED = "STOPPED"
 LIVE_IDLE = "LIVE_IDLE"
@@ -55,6 +92,11 @@ SURFACE_CREATED = "created"
 SURFACE_DELETE_ATTEMPTED = "delete attempted"
 SURFACE_DELETED = "deleted"
 SURFACE_FAILED = "failed/uncertain"
+SURFACE_KIND_STATIC_CHUNK = "STATIC_CHUNK"
+SURFACE_KIND_MOVING_PLATFORM = "MOVING_PLATFORM"
+SURFACE_KIND_OPTIONAL_DEBUG = "OPTIONAL_DEBUG_SURFACE"
+PLATFORM_TRANSFORM_TOLERANCE = 1.0e-6
+PLATFORM_ROTATION_TOLERANCE = 1.0e-7
 
 origin_offset = [0.0, 0.0, 0.0]
 original_fps = 0
@@ -62,7 +104,7 @@ original_fps_setting = 0
 original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
 simulation_scene = None
-RUNTIME_API_VERSION = 6
+RUNTIME_API_VERSION = 8
 
 SM64SurfaceVertex = ct.c_int32 * 3
 SM64SurfaceVertices = SM64SurfaceVertex * 3
@@ -135,8 +177,181 @@ class SM64MarioGeometryBuffers(ct.Structure):
     def __del__(self):
         pass
 
+
+SM64PlaySoundFunctionPtr = ct.CFUNCTYPE(
+    None, ct.c_uint32, ct.POINTER(ct.c_float)
+)
+SM64DebugPrintFunctionPtr = ct.CFUNCTYPE(None, ct.c_char_p)
+
 class MarioLifecycleError(RuntimeError):
     pass
+
+
+class MarioFeatureUnavailableError(RuntimeError):
+    """A recoverable optional-feature failure that leaves native ownership intact."""
+
+
+def _require_integer_range(name, value, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("{} must be an integer".format(name))
+    if value < minimum or value > maximum:
+        raise ValueError(
+            "{} must be between {} and {}".format(name, minimum, maximum)
+        )
+    return value
+
+
+def _require_finite_float(name, value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("{} must be a finite number".format(name)) from exc
+    if not math.isfinite(result):
+        raise ValueError("{} must be a finite number".format(name))
+    return result
+
+
+def _require_float3(name, value):
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise ValueError("{} must be a three-value tuple".format(name))
+    for index, component in enumerate(value):
+        _require_finite_float("{}[{}]".format(name, index), component)
+    return value
+
+
+@dataclass(frozen=True)
+class MarioStartMark:
+    """Immutable, generation-owned snapshot of public modern Mario state.
+
+    ``particle_flags`` is retained for observation and diagnostics only because
+    the pinned ABI does not expose a safe setter for it.
+    """
+
+    schema_version: int
+    owner_token: str
+    lifecycle_generation: int
+    position: tuple
+    velocity: tuple
+    face_angle: float
+    forward_velocity: float
+    health: int
+    action: int
+    anim_id: int
+    anim_frame: int
+    flags: int
+    particle_flags: int
+    invincibility_timer: int
+
+    def __post_init__(self):
+        if self.schema_version != START_MARK_SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported Start Mark schema {}; expected {}".format(
+                    self.schema_version, START_MARK_SCHEMA_VERSION
+                )
+            )
+        if not isinstance(self.owner_token, str) or not self.owner_token:
+            raise ValueError("Start Mark owner token is invalid")
+        _require_integer_range(
+            "lifecycle_generation", self.lifecycle_generation, 1, 0x7FFFFFFF
+        )
+        _require_float3("position", self.position)
+        _require_float3("velocity", self.velocity)
+        _require_finite_float("face_angle", self.face_angle)
+        _require_finite_float("forward_velocity", self.forward_velocity)
+        _require_integer_range("health", self.health, 0, 0x7FFF)
+        _require_integer_range("action", self.action, 0, 0xFFFFFFFF)
+        _require_integer_range("anim_id", self.anim_id, -0x80000000, 0x7FFFFFFF)
+        _require_integer_range("anim_frame", self.anim_frame, -0x8000, 0x7FFF)
+        _require_integer_range("flags", self.flags, 0, 0xFFFFFFFF)
+        _require_integer_range("particle_flags", self.particle_flags, 0, 0xFFFFFFFF)
+        _require_integer_range(
+            "invincibility_timer", self.invincibility_timer, -0x8000, 0x7FFF
+        )
+
+
+@dataclass(frozen=True)
+class MarioCapRequest:
+    operation: str
+    cap_flag: int
+    duration_ticks: int
+    play_music: bool
+    simulation_tick: int
+
+    def __post_init__(self):
+        if self.operation not in ("grant", "extend"):
+            raise ValueError("Unknown cap request operation: {}".format(self.operation))
+        if self.operation == "grant" and self.cap_flag not in SUPPORTED_CAP_FLAGS:
+            raise ValueError("Unsupported cap flag: 0x{:08X}".format(self.cap_flag))
+        if self.operation == "extend" and self.cap_flag != 0:
+            raise ValueError("Cap extension history must use cap flag 0")
+        minimum = 0 if self.operation == "grant" else 1
+        _require_integer_range("duration_ticks", self.duration_ticks, minimum, 0xFFFF)
+        if not isinstance(self.play_music, bool):
+            raise ValueError("play_music must be a bool")
+        _require_integer_range("simulation_tick", self.simulation_tick, 0, 0x7FFFFFFF)
+
+
+@dataclass(frozen=True)
+class NativeDebugMessage:
+    owner_token: str
+    lifecycle_generation: int
+    text: str
+    monotonic_time: float
+
+    def __post_init__(self):
+        if not self.owner_token or not isinstance(self.owner_token, str):
+            raise ValueError("Debug message owner token is invalid")
+        _require_integer_range(
+            "debug lifecycle generation", self.lifecycle_generation, 1, 0x7FFFFFFF
+        )
+        if not isinstance(self.text, str):
+            raise ValueError("Debug message text must be a string")
+        _require_finite_float("debug message time", self.monotonic_time)
+
+
+@dataclass(frozen=True)
+class CollisionProbeResult:
+    blender_position: tuple
+    native_position: tuple
+    floor_native_height: float
+    floor_blender_height: object
+    no_floor: bool
+    water_native_height: float
+    water_blender_height: object
+    gas_native_height: float
+    gas_blender_height: object
+    chunk_key: tuple
+    chunk_active: bool
+    nearby_static_surface_count: int
+    active_static_surface_count: int
+    active_moving_platform_surface_count: int
+
+    def __post_init__(self):
+        _require_float3("probe Blender position", self.blender_position)
+        _require_float3("probe native position", self.native_position)
+        for name, value in (
+            ("floor native height", self.floor_native_height),
+            ("water native height", self.water_native_height),
+            ("gas native height", self.gas_native_height),
+        ):
+            _require_finite_float(name, value)
+        for name, value in (
+            ("floor Blender height", self.floor_blender_height),
+            ("water Blender height", self.water_blender_height),
+            ("gas Blender height", self.gas_blender_height),
+        ):
+            if value is not None:
+                _require_finite_float(name, value)
+        if not isinstance(self.chunk_key, tuple) or len(self.chunk_key) != 2:
+            raise ValueError("Probe chunk key must contain two integers")
+        for value in self.chunk_key:
+            _require_integer_range("probe chunk coordinate", value, -0x80000000, 0x7FFFFFFF)
+        for name, value in (
+            ("nearby surface count", self.nearby_static_surface_count),
+            ("active static surface count", self.active_static_surface_count),
+            ("moving platform surface count", self.active_moving_platform_surface_count),
+        ):
+            _require_integer_range(name, value, 0, 0x7FFFFFFF)
 
 
 @dataclass
@@ -145,10 +360,50 @@ class NativeSurfaceOwnership:
     owner_token: str
     generation: int
     surface_count: int
+    ownership_kind: str = SURFACE_KIND_STATIC_CHUNK
     state: str = SURFACE_PREPARED
     object_id: object = None
     creation_order: int = 0
     diagnostic: str = ""
+
+
+@dataclass(frozen=True)
+class NativePlatformTransform:
+    position: tuple
+    euler_rotation_degrees: tuple
+    rotation_matrix: tuple
+    blender_scale: tuple
+
+    def __post_init__(self):
+        _require_float3("platform position", self.position)
+        _require_float3("platform Euler rotation", self.euler_rotation_degrees)
+        _require_float3("platform scale", self.blender_scale)
+        if len(self.rotation_matrix) != 9:
+            raise ValueError("Platform rotation matrix must contain nine values")
+        for index, value in enumerate(self.rotation_matrix):
+            _require_finite_float("platform rotation[{}]".format(index), value)
+        if any(abs(float(value)) <= 1.0e-12 for value in self.blender_scale):
+            raise ValueError("Moving Platform scale cannot contain zero")
+
+
+@dataclass
+class MovingPlatformOwnership:
+    object_key: tuple
+    object_name: str
+    owner_token: str
+    generation: int
+    surface_count: int
+    geometry_fingerprint: str
+    initial_scale: tuple
+    previous_transform: object
+    current_transform: object
+    state: str = SURFACE_PREPARED
+    object_id: object = None
+    creation_order: int = 0
+    last_updated_tick: int = -1
+    diagnostic: str = ""
+    transform_valid: bool = True
+    ownership_kind: str = SURFACE_KIND_MOVING_PLATFORM
 
 
 def _native_stage(stage):
@@ -314,6 +569,36 @@ class NativeLifecycle:
         self.neutral_input_ticks = 0
         self.recording_tick_origin = None
         self.persistent_start_mark = None
+        self.start_mark_restoration_mode = START_MARK_PERFORMANCE
+        self.last_start_mark_restoration = None
+        self.environment_levels = {
+            ENVIRONMENT_WATER: {
+                "enabled": False, "blender_height": None,
+                "native_level": ENVIRONMENT_DISABLED_NATIVE_LEVEL,
+            },
+            ENVIRONMENT_GAS: {
+                "enabled": False, "blender_height": None,
+                "native_level": ENVIRONMENT_DISABLED_NATIVE_LEVEL,
+            },
+        }
+        self.last_environment_error = ""
+        self.cap_request_history = []
+        self.last_cap_error = ""
+        self.force_full_mesh_updates = 0
+        self.optional_api_features = set()
+        self.native_call_lock = threading.RLock()
+        self.audio_runtime = LiveAudioRuntime()
+        self.rom_image = None
+        self.play_sound_callback = None
+        self.play_sound_callback_registered = False
+        self.sound_events = deque(maxlen=AUDIO_SOUND_EVENT_HISTORY_LIMIT)
+        self.debug_print_callback = None
+        self.debug_print_callback_registered = False
+        self.native_debug_log = deque(maxlen=NATIVE_DEBUG_LOG_LIMIT)
+        self.last_debug_error = ""
+        self.last_collision_query = None
+        self.last_directing_operation = None
+        self.last_directing_error = ""
         self.native_ownership_uncertain = False
         self.shutdown_in_progress = False
         self.shutdown_complete = False
@@ -326,12 +611,20 @@ class NativeLifecycle:
         self.input_started = False
         self.collision_cache = CollisionCache()
         self.native_surface_objects = {}
+        self.moving_platform_objects = {}
+        self.native_surface_id_registry = {}
+        self.disabled_moving_platforms = {}
+        self.dirty_moving_platforms = set()
+        self.initial_collision_roles = {}
         self.active_chunk_keys = set()
         self.collision_center = None
         self.pending_transition_state = "idle"
         self.surface_create_count = 0
         self.surface_delete_count = 0
         self.active_surface_count = 0
+        self.moving_platform_surface_count = 0
+        self.platform_move_count = 0
+        self.last_platform_error = ""
         self.collision_stats = {
             "objects_scanned_by_bounds": 0,
             "objects_evaluated": 0,
@@ -437,6 +730,129 @@ def native_position_to_blender(native_x, native_y, native_z):
     )
 
 
+def blender_position_to_native(position, scale=None, session_origin=None):
+    """Convert Blender world XYZ to libsm64 XYZ through one central mapping."""
+    scale = float(SM64_SCALE_FACTOR if scale is None else scale)
+    session_origin = origin_offset if session_origin is None else session_origin
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Blender-to-SM64 scale must be finite and positive")
+    _require_float3("Blender position", tuple(position))
+    _require_float3("session origin", tuple(session_origin))
+    return (
+        scale * (float(position[0]) - float(session_origin[0])),
+        scale * (float(position[2]) - float(session_origin[2])),
+        scale * (-float(position[1]) + float(session_origin[1])),
+    )
+
+
+def blender_height_to_native_level(height, scale=None, session_origin=None):
+    """Convert a Blender world-Z level to libsm64's signed native Y level."""
+    height = _require_finite_float("environment height", height)
+    scale = float(SM64_SCALE_FACTOR if scale is None else scale)
+    session_origin = origin_offset if session_origin is None else session_origin
+    native_y = blender_position_to_native(
+        (float(session_origin[0]), float(session_origin[1]), height),
+        scale,
+        session_origin,
+    )[1]
+    native_level, valid = _checked_int32_coordinate(native_y)
+    if not valid:
+        raise ValueError("Environment height is outside libsm64's signed 32-bit range")
+    return native_level
+
+
+def native_height_to_blender(native_height, scale=None, session_origin=None):
+    """Convert a native vertical Y height to Blender world Z."""
+    native_height = _require_finite_float("native height", native_height)
+    scale = float(SM64_SCALE_FACTOR if scale is None else scale)
+    session_origin = origin_offset if session_origin is None else session_origin
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Blender-to-SM64 scale must be finite and positive")
+    _require_float3("session origin", tuple(session_origin))
+    return float(session_origin[2]) + native_height / scale
+
+
+def blender_local_vector_to_native(vector, scale=None):
+    """Map a Blender-local vector without applying the session origin."""
+    scale = float(SM64_SCALE_FACTOR if scale is None else scale)
+    vector = tuple(vector)
+    _require_float3("Blender local vector", vector)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Blender-to-SM64 scale must be finite and positive")
+    return (
+        scale * float(vector[0]),
+        scale * float(vector[2]),
+        -scale * float(vector[1]),
+    )
+
+
+def blender_rotation_matrix_to_native(rotation_matrix):
+    """Conjugate a Blender XYZ rotation into native X/Y/-Z coordinates."""
+    basis = mathutils.Matrix(((1.0, 0.0, 0.0),
+                              (0.0, 0.0, 1.0),
+                              (0.0, -1.0, 0.0)))
+    matrix = mathutils.Matrix(rotation_matrix).to_3x3()
+    values = tuple(float(value) for row in matrix for value in row)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Moving Platform rotation contains non-finite values")
+    return basis @ matrix @ basis.transposed()
+
+
+def native_transform_matrix_to_zxy_euler_degrees(native_rotation_matrix):
+    """Convert a native rotation matrix to libsm64's ZXY Euler degrees."""
+    matrix = mathutils.Matrix(native_rotation_matrix).to_3x3()
+    euler = matrix.to_euler('ZXY')
+    degrees = tuple(math.degrees(value) for value in (euler.x, euler.y, euler.z))
+    _require_float3("native ZXY Euler degrees", degrees)
+    return degrees
+
+
+def native_zxy_euler_degrees_to_matrix(euler_degrees):
+    """Reconstruct a native matrix for conversion tests and diagnostics."""
+    euler_degrees = tuple(euler_degrees)
+    _require_float3("native ZXY Euler degrees", euler_degrees)
+    radians = tuple(math.radians(value) for value in euler_degrees)
+    return mathutils.Euler(radians, 'ZXY').to_matrix()
+
+
+def blender_matrix_to_native_transform(matrix_world, scale=None, session_origin=None):
+    """Decompose one evaluated Blender matrix into a rigid native transform.
+
+    Scale is returned separately for baking into local vertices. Shear or a
+    non-finite/non-invertible decomposition is rejected rather than silently
+    generating incorrect collision.
+    """
+    matrix = mathutils.Matrix(matrix_world).to_4x4()
+    values = tuple(float(value) for row in matrix for value in row)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Moving Platform matrix contains non-finite values")
+    location, rotation, blender_scale = matrix.decompose()
+    scale_tuple = tuple(float(value) for value in blender_scale)
+    _require_float3("Moving Platform scale", scale_tuple)
+    if any(abs(value) <= 1.0e-12 for value in scale_tuple):
+        raise ValueError("Moving Platform transform has zero scale")
+    reconstructed = mathutils.Matrix.LocRotScale(location, rotation, blender_scale)
+    largest = max(1.0, *(abs(value) for value in values))
+    difference = max(
+        abs(float(matrix[row][column]) - float(reconstructed[row][column]))
+        for row in range(4) for column in range(4)
+    )
+    if difference > PLATFORM_TRANSFORM_TOLERANCE * largest:
+        raise ValueError("Moving Platform transform contains unsupported shear")
+    native_rotation = blender_rotation_matrix_to_native(rotation.to_matrix())
+    rotation_values = tuple(float(value) for row in native_rotation for value in row)
+    return NativePlatformTransform(
+        position=blender_position_to_native(
+            tuple(float(value) for value in location), scale, session_origin
+        ),
+        euler_rotation_degrees=native_transform_matrix_to_zxy_euler_degrees(
+            native_rotation
+        ),
+        rotation_matrix=rotation_values,
+        blender_scale=scale_tuple,
+    )
+
+
 def _write_active_mario_coordinates(coordinates, active_vertex_count):
     positions = mario_geo.position_data
     for vertex_index in range(active_vertex_count):
@@ -458,6 +874,22 @@ def _lifecycle_log(session, message):
     print("libsm64 lifecycle [{}] {}".format(session.generation, message))
 
 
+def _native_call(session, export_name, *arguments):
+    """Serialize one internal libsm64 call for this lifecycle generation.
+
+    Public operations still pass through :func:`require_owned_mario_operation`.
+    This lower-level boundary also covers startup and shutdown calls, which
+    deliberately occur before commit or after shutdown begins.
+    """
+    library = session.library
+    if library is None:
+        raise MarioLifecycleError(
+            "Native call {} rejected without an owned library".format(export_name)
+        )
+    with session.native_call_lock:
+        return getattr(library, export_name)(*arguments)
+
+
 def lifecycle_snapshot():
     session = _lifecycle
     return {
@@ -474,6 +906,26 @@ def lifecycle_snapshot():
         "timer_installed": session.timer_installed,
         "control_state": session.control_state,
         "last_error": session.last_error,
+        "start_mark_schema_version": START_MARK_SCHEMA_VERSION,
+        "start_mark_restoration_mode": session.start_mark_restoration_mode,
+        "last_start_mark_restoration": session.last_start_mark_restoration,
+        "environment_levels": {
+            kind: dict(values) for kind, values in session.environment_levels.items()
+        },
+        "last_environment_error": session.last_environment_error,
+        "cap_request_history": tuple(session.cap_request_history),
+        "last_cap_error": session.last_cap_error,
+        "force_full_mesh_updates": session.force_full_mesh_updates,
+        "audio": session.audio_runtime.snapshot(),
+        "play_sound_callback_registered": session.play_sound_callback_registered,
+        "sound_event_count": len(session.sound_events),
+        "debug_print_callback_registered": session.debug_print_callback_registered,
+        "native_debug_log": tuple(session.native_debug_log),
+        "last_debug_error": session.last_debug_error,
+        "last_collision_query": session.last_collision_query,
+        "last_directing_operation": session.last_directing_operation,
+        "last_directing_error": session.last_directing_error,
+        "optional_api_features": tuple(sorted(session.optional_api_features)),
         "native_ownership_uncertain": session.native_ownership_uncertain,
         "shutdown_in_progress": session.shutdown_in_progress,
         "shutdown_complete": session.shutdown_complete,
@@ -483,10 +935,26 @@ def lifecycle_snapshot():
             if record.object_id is not None and record.state in (
                 SURFACE_CREATED, SURFACE_DELETE_ATTEMPTED, SURFACE_FAILED,
             )
+        ) + sum(
+            1 for record in session.moving_platform_objects.values()
+            if record.object_id is not None and record.state in (
+                SURFACE_CREATED, SURFACE_DELETE_ATTEMPTED, SURFACE_FAILED,
+            )
         ),
         "owned_surface_ids": tuple(sorted(
-            int(record.object_id) for record in session.native_surface_objects.values()
+            int(object_id) for object_id in session.native_surface_id_registry
+        )),
+        "moving_platform_count": len(session.moving_platform_objects),
+        "moving_platform_ids": tuple(sorted(
+            int(record.object_id) for record in session.moving_platform_objects.values()
             if record.object_id is not None
+        )),
+        "moving_platform_surface_count": session.moving_platform_surface_count,
+        "platform_move_count": session.platform_move_count,
+        "last_platform_error": session.last_platform_error,
+        "disabled_moving_platforms": tuple(sorted(
+            (repr(key), message)
+            for key, message in session.disabled_moving_platforms.items()
         )),
         "active_chunk_keys": tuple(sorted(session.active_chunk_keys)),
         "pending_transition_state": session.pending_transition_state,
@@ -775,6 +1243,905 @@ def _configure_native_api(library):
     _native_stage("after_abi_configuration")
 
 
+def _configure_start_mark_api(library):
+    """Lazily bind only the setters used by Better Start Marks.
+
+    These exports are intentionally not prerequisites for basic Live Mario
+    startup. A mismatched library disables rich restoration when invoked while
+    leaving the already-owned core session usable.
+    """
+    if getattr(library, "_libsm64_start_mark_api_configured", False):
+        return
+    exports = (
+        "sm64_set_mario_action",
+        "sm64_set_mario_animation",
+        "sm64_set_mario_anim_frame",
+        "sm64_set_mario_state",
+        "sm64_set_mario_position",
+        "sm64_set_mario_faceangle",
+        "sm64_set_mario_velocity",
+        "sm64_set_mario_forward_velocity",
+        "sm64_set_mario_health",
+        "sm64_set_mario_invincibility",
+    )
+    missing = [name for name in exports if not hasattr(library, name)]
+    if missing:
+        raise MarioFeatureUnavailableError(
+            "Better Start Mark restoration is unavailable because the native "
+            "library is missing: {}. Live Mario remains usable.".format(
+                ", ".join(missing)
+            )
+        )
+
+    library.sm64_set_mario_action.argtypes = [ct.c_int32, ct.c_uint32]
+    library.sm64_set_mario_action.restype = None
+    library.sm64_set_mario_animation.argtypes = [ct.c_int32, ct.c_int32]
+    library.sm64_set_mario_animation.restype = None
+    library.sm64_set_mario_anim_frame.argtypes = [ct.c_int32, ct.c_int16]
+    library.sm64_set_mario_anim_frame.restype = None
+    library.sm64_set_mario_state.argtypes = [ct.c_int32, ct.c_uint32]
+    library.sm64_set_mario_state.restype = None
+    library.sm64_set_mario_position.argtypes = [
+        ct.c_int32, ct.c_float, ct.c_float, ct.c_float,
+    ]
+    library.sm64_set_mario_position.restype = None
+    library.sm64_set_mario_faceangle.argtypes = [ct.c_int32, ct.c_float]
+    library.sm64_set_mario_faceangle.restype = None
+    library.sm64_set_mario_velocity.argtypes = [
+        ct.c_int32, ct.c_float, ct.c_float, ct.c_float,
+    ]
+    library.sm64_set_mario_velocity.restype = None
+    library.sm64_set_mario_forward_velocity.argtypes = [ct.c_int32, ct.c_float]
+    library.sm64_set_mario_forward_velocity.restype = None
+    library.sm64_set_mario_health.argtypes = [ct.c_int32, ct.c_uint16]
+    library.sm64_set_mario_health.restype = None
+    library.sm64_set_mario_invincibility.argtypes = [ct.c_int32, ct.c_int16]
+    library.sm64_set_mario_invincibility.restype = None
+    library._libsm64_start_mark_api_configured = True
+
+
+def _environment_export_name(kind):
+    if kind == ENVIRONMENT_WATER:
+        return "sm64_set_mario_water_level"
+    if kind == ENVIRONMENT_GAS:
+        return "sm64_set_mario_gas_level"
+    raise ValueError("Unknown environment level kind: {}".format(kind))
+
+
+def _configure_environment_level_api(library, kind):
+    """Lazily bind one optional global-level setter.
+
+    Water and gas are configured independently so a disabled or unavailable
+    sibling feature cannot prevent the other feature, or basic Live Mario, from
+    running.
+    """
+    export_name = _environment_export_name(kind)
+    configured_flag = "_libsm64_{}_api_configured".format(kind)
+    if getattr(library, configured_flag, False):
+        return
+    if not hasattr(library, export_name):
+        raise MarioFeatureUnavailableError(
+            "{} controls are unavailable because the native library is missing "
+            "{}. Live Mario remains usable.".format(kind.title(), export_name)
+        )
+    setter = getattr(library, export_name)
+    setter.argtypes = [ct.c_int32, ct.c_int]
+    setter.restype = None
+    setattr(library, configured_flag, True)
+
+
+def _scene_environment_request(scene, kind):
+    if kind not in ENVIRONMENT_LEVEL_KINDS:
+        raise ValueError("Unknown environment level kind: {}".format(kind))
+    settings = getattr(scene, "libsm64", None)
+    if settings is None:
+        return False, None, ENVIRONMENT_DISABLED_NATIVE_LEVEL
+    enabled_name = "enable_water" if kind == ENVIRONMENT_WATER else "enable_poison_gas"
+    enabled = bool(getattr(settings, enabled_name))
+    blender_height = _require_finite_float(
+        "{} height".format(kind), getattr(settings, "{}_height".format(kind))
+    )
+    native_level = (
+        blender_height_to_native_level(blender_height)
+        if enabled else ENVIRONMENT_DISABLED_NATIVE_LEVEL
+    )
+    return enabled, blender_height, native_level
+
+
+def _set_environment_level_for_session(session, scene, kind, include_disabled=True):
+    enabled, blender_height, native_level = _scene_environment_request(scene, kind)
+    if not enabled and not include_disabled:
+        # A freshly created Mario already has the pinned decomp's canonical
+        # -10000 value, so disabled optional exports need not be required.
+        session.environment_levels[kind] = {
+            "enabled": False,
+            "blender_height": blender_height,
+            "native_level": ENVIRONMENT_DISABLED_NATIVE_LEVEL,
+        }
+        return native_level
+    _configure_environment_level_api(session.library, kind)
+    _native_call(
+        session,
+        _environment_export_name(kind),
+        int(session.mario_id),
+        int(native_level),
+    )
+    session.optional_api_features.add("{}_level".format(kind))
+    session.environment_levels[kind] = {
+        "enabled": enabled,
+        "blender_height": blender_height,
+        "native_level": native_level,
+    }
+    session.last_environment_error = ""
+    return native_level
+
+
+def _apply_environment_after_mario_create(session):
+    """Apply only enabled scene levels before the replacement Mario's first tick."""
+    scene = session.scene
+    if scene is None:
+        return
+    for kind in ENVIRONMENT_LEVEL_KINDS:
+        try:
+            _set_environment_level_for_session(
+                session, scene, kind, include_disabled=False
+            )
+        except MarioFeatureUnavailableError as exc:
+            # Optional export absence is recoverable and does not invalidate the
+            # newly created Mario or any native ownership.
+            session.last_environment_error = str(exc)
+            print("libsm64 environment feature unavailable: {}".format(exc))
+        except Exception as exc:
+            session.native_ownership_uncertain = True
+            raise MarioLifecycleError(
+                "Could not apply the enabled {} level after Mario creation: {}".format(
+                    kind, exc
+                )
+            ) from exc
+
+
+def apply_scene_environment_level(scene, kind):
+    """Apply one UI level to an exactly owned Mario without replacing him.
+
+    Returns False when no Live Mario exists, which keeps saved environment
+    settings independent from already-baked playback.
+    """
+    session = _lifecycle
+    if not is_mario_running():
+        return False
+    try:
+        session = require_owned_mario_operation(session)
+        _set_environment_level_for_session(session, scene, kind, include_disabled=True)
+    except (ValueError, MarioFeatureUnavailableError) as exc:
+        session.last_environment_error = str(exc)
+        print("libsm64 environment setting rejected: {}".format(exc))
+        return False
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native {} level update failed; use End Studio Session and restart "
+            "Blender: {}".format(kind, exc),
+        )
+        session.last_environment_error = session.last_error
+        return False
+    return True
+
+
+def environment_diagnostics():
+    session = _lifecycle
+    return {
+        "disabled_native_level": ENVIRONMENT_DISABLED_NATIVE_LEVEL,
+        "levels": {
+            kind: dict(values) for kind, values in session.environment_levels.items()
+        },
+        "last_error": session.last_environment_error,
+    }
+
+
+def _configure_cap_api(library):
+    """Lazily bind cap grant/extension without affecting core startup."""
+    if getattr(library, "_libsm64_cap_api_configured", False):
+        return
+    exports = ("sm64_mario_interact_cap", "sm64_mario_extend_cap")
+    missing = [name for name in exports if not hasattr(library, name)]
+    if missing:
+        raise MarioFeatureUnavailableError(
+            "Cap controls are unavailable because the native library is missing: "
+            "{}. Live Mario remains usable.".format(", ".join(missing))
+        )
+    library.sm64_mario_interact_cap.argtypes = [
+        ct.c_int32, ct.c_uint32, ct.c_uint16, ct.c_uint8,
+    ]
+    library.sm64_mario_interact_cap.restype = None
+    library.sm64_mario_extend_cap.argtypes = [ct.c_int32, ct.c_uint16]
+    library.sm64_mario_extend_cap.restype = None
+    library._libsm64_cap_api_configured = True
+
+
+def _record_cap_request(session, request):
+    session.cap_request_history.append(request)
+    if len(session.cap_request_history) > CAP_REQUEST_HISTORY_LIMIT:
+        del session.cap_request_history[:-CAP_REQUEST_HISTORY_LIMIT]
+    session.last_cap_error = ""
+
+
+def grant_mario_cap(cap_flag, duration_ticks=0, play_music=False):
+    """Grant one pinned special cap to the exactly owned Live Mario.
+
+    A duration of zero deliberately reaches native code unchanged: the pinned
+    implementation selects 600 ticks for Metal/Vanish and 1800 for Wing.
+    """
+    cap_flag = _require_integer_range("cap_flag", cap_flag, 0, 0xFFFFFFFF)
+    if cap_flag not in SUPPORTED_CAP_FLAGS:
+        raise ValueError("Unsupported cap flag: 0x{:08X}".format(cap_flag))
+    duration_ticks = _require_integer_range(
+        "duration_ticks", duration_ticks, 0, 0xFFFF
+    )
+    if not isinstance(play_music, bool):
+        raise ValueError("play_music must be a bool")
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    try:
+        _configure_cap_api(session.library)
+        _native_call(
+            session,
+            "sm64_mario_interact_cap",
+            int(session.mario_id), cap_flag, duration_ticks, int(play_music),
+        )
+    except MarioFeatureUnavailableError as exc:
+        session.last_cap_error = str(exc)
+        raise
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native cap grant failed; use End Studio Session and restart Blender: {}".format(
+                exc
+            ),
+        )
+        session.last_cap_error = session.last_error
+        raise MarioLifecycleError(session.last_error) from exc
+    session.optional_api_features.add("cap_controls")
+    # Cap geometry can change UV/color as well as positions. Force the full
+    # live mesh path after a grant even when the usual startup-only UV/color
+    # refresh window has elapsed, so a subsequently baked single-cap take owns
+    # the visible cap state present on its source mesh.
+    session.force_full_mesh_updates = max(session.force_full_mesh_updates, 2)
+    _record_cap_request(
+        session,
+        MarioCapRequest(
+            "grant", cap_flag, duration_ticks, play_music, max(0, int(tick_count))
+        ),
+    )
+    return cap_flag
+
+
+def extend_mario_cap(duration_ticks):
+    duration_ticks = _require_integer_range(
+        "duration_ticks", duration_ticks, 1, 0xFFFF
+    )
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    try:
+        _configure_cap_api(session.library)
+        _native_call(
+            session,
+            "sm64_mario_extend_cap",
+            int(session.mario_id), duration_ticks,
+        )
+    except MarioFeatureUnavailableError as exc:
+        session.last_cap_error = str(exc)
+        raise
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native cap extension failed; use End Studio Session and restart "
+            "Blender: {}".format(exc),
+        )
+        session.last_cap_error = session.last_error
+        raise MarioLifecycleError(session.last_error) from exc
+    session.optional_api_features.add("cap_controls")
+    _record_cap_request(
+        session,
+        MarioCapRequest(
+            "extend", 0, duration_ticks, False, max(0, int(tick_count))
+        ),
+    )
+    return duration_ticks
+
+
+def cap_diagnostics():
+    session = _lifecycle
+    audio_state = session.audio_runtime.snapshot()
+    return {
+        "supported_flags": SUPPORTED_CAP_FLAGS,
+        "history": tuple(session.cap_request_history),
+        "last_error": session.last_cap_error,
+        "music_enabled": bool(
+            audio_state["audio_worker_started"]
+            and audio_state["audio_device_opened"]
+            and not audio_state["muted"]
+        ),
+    }
+
+
+def _configure_audio_api(library):
+    """Lazily bind audio exports without making core startup depend on them."""
+    if getattr(library, "_libsm64_audio_api_configured", False):
+        return
+    exports = ("sm64_audio_init", "sm64_audio_tick")
+    missing = [name for name in exports if not hasattr(library, name)]
+    if missing:
+        raise MarioFeatureUnavailableError(
+            "Live audio is unavailable because the native library is missing: "
+            "{}. Live Mario remains usable.".format(", ".join(missing))
+        )
+    library.sm64_audio_init.argtypes = [ct.POINTER(ct.c_uint8)]
+    library.sm64_audio_init.restype = None
+    library.sm64_audio_tick.argtypes = [
+        ct.c_uint32, ct.c_uint32, ct.POINTER(ct.c_int16),
+    ]
+    library.sm64_audio_tick.restype = ct.c_uint32
+    if hasattr(library, "sm64_set_sound_volume"):
+        library.sm64_set_sound_volume.argtypes = [ct.c_float]
+        library.sm64_set_sound_volume.restype = None
+    if hasattr(library, "sm64_register_play_sound_function"):
+        library.sm64_register_play_sound_function.argtypes = [
+            SM64PlaySoundFunctionPtr,
+        ]
+        library.sm64_register_play_sound_function.restype = None
+    library._libsm64_audio_api_configured = True
+
+
+def _register_play_sound_callback(session):
+    if session.play_sound_callback_registered:
+        return
+    if not hasattr(session.library, "sm64_register_play_sound_function"):
+        return
+    owner_token = session.owner_token
+    generation = session.generation
+
+    def receive_sound(sound_bits, position):
+        # Native callbacks may arrive on the audio worker.  Copy values into a
+        # bounded Python deque only; Blender RNA remains main-thread-only.
+        try:
+            native_position = (
+                tuple(float(position[index]) for index in range(3))
+                if bool(position) else (0.0, 0.0, 0.0)
+            )
+            session.sound_events.append((
+                owner_token,
+                generation,
+                int(sound_bits),
+                native_position,
+                time.monotonic(),
+            ))
+        except Exception:
+            # Exceptions must never unwind through a C callback boundary.
+            return
+
+    callback = SM64PlaySoundFunctionPtr(receive_sound)
+    _native_call(
+        session, "sm64_register_play_sound_function", callback
+    )
+    session.play_sound_callback = callback
+    session.play_sound_callback_registered = True
+
+
+def _unregister_play_sound_callback(session):
+    if not session.play_sound_callback_registered:
+        session.play_sound_callback = None
+        return
+    if session.library is not None and hasattr(
+        session.library, "sm64_register_play_sound_function"
+    ):
+        _native_call(
+            session,
+            "sm64_register_play_sound_function",
+            SM64PlaySoundFunctionPtr(),
+        )
+    session.play_sound_callback_registered = False
+    session.play_sound_callback = None
+
+
+def _scene_audio_request(scene):
+    settings = getattr(scene, "libsm64", None)
+    if settings is None:
+        return False, 1.0, False
+    return (
+        bool(getattr(settings, "enable_live_audio", False)),
+        _require_finite_float("audio volume", getattr(settings, "audio_volume", 1.0)),
+        bool(getattr(settings, "audio_mute", False)),
+    )
+
+
+def start_live_audio(session=None):
+    session = require_owned_mario_operation(
+        session, allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    requested, volume, muted = _scene_audio_request(session.scene)
+    if not requested:
+        return False
+    if not 0.0 <= volume <= 1.0:
+        raise ValueError("Audio volume must be between 0 and 1")
+    if session.rom_image is None:
+        raise MarioFeatureUnavailableError(
+            "Live audio cannot start because this session no longer owns its ROM image"
+        )
+    try:
+        _configure_audio_api(session.library)
+        _register_play_sound_callback(session)
+        session.audio_runtime.initialize_and_start(
+            session.library,
+            session.rom_image,
+            session.native_call_lock,
+            volume,
+            muted,
+        )
+    except (MarioFeatureUnavailableError, AudioBackendError, ValueError) as exc:
+        session.audio_runtime.audio_failure = str(exc)
+        session.audio_runtime.audio_requested = False
+        try:
+            _unregister_play_sound_callback(session)
+        except Exception as cleanup_exc:
+            session.native_ownership_uncertain = True
+            _poison_session(
+                session,
+                "Audio callback cleanup failed; restart Blender: {}".format(
+                    cleanup_exc
+                ),
+            )
+            raise MarioLifecycleError(session.last_error) from cleanup_exc
+        print("libsm64 optional audio disabled: {}".format(exc))
+        return False
+    except Exception as exc:
+        if session.audio_runtime.native_failure:
+            _poison_session(
+                session,
+                "Native audio initialization left execution state uncertain; restart "
+                "Blender: {}".format(exc),
+            )
+            raise MarioLifecycleError(session.last_error) from exc
+        session.audio_runtime.audio_failure = str(exc)
+        session.audio_runtime.audio_requested = False
+        _unregister_play_sound_callback(session)
+        print("libsm64 optional audio disabled: {}".format(exc))
+        return False
+    session.optional_api_features.add("live_audio")
+    return True
+
+
+def stop_live_audio(session=None):
+    session = session or _lifecycle
+    stopped = session.audio_runtime.stop_worker()
+    if not stopped:
+        session.native_ownership_uncertain = True
+        _poison_session(session, session.audio_runtime.audio_failure)
+        return False
+    if session.play_sound_callback_registered:
+        try:
+            _unregister_play_sound_callback(session)
+        except Exception as exc:
+            session.native_ownership_uncertain = True
+            _poison_session(
+                session,
+                "Audio callback cleanup failed; restart Blender: {}".format(exc),
+            )
+            return False
+    return stopped
+
+
+def apply_scene_audio_settings(scene):
+    """Apply UI audio changes without changing Mario or collision ownership."""
+    session = _lifecycle
+    if not is_mario_running() or session.scene is not scene:
+        return False
+    requested, volume, muted = _scene_audio_request(scene)
+    if not 0.0 <= volume <= 1.0:
+        session.audio_runtime.audio_failure = "Audio volume must be between 0 and 1"
+        return False
+    if not requested:
+        stop_live_audio(session)
+        return True
+    state = session.audio_runtime.snapshot()
+    if not state["audio_worker_started"]:
+        return start_live_audio(session)
+    try:
+        session.audio_runtime.set_output(volume, muted)
+    except Exception as exc:
+        session.audio_runtime.audio_failure = str(exc)
+        stop_live_audio(session)
+        return False
+    return True
+
+
+def _poll_audio_runtime(session):
+    state = session.audio_runtime.snapshot()
+    if state["audio_failure"] and not state["audio_worker_started"]:
+        session.audio_runtime.stop_worker()
+        if state["native_failure"] and session.control_state != POISONED:
+            session.native_ownership_uncertain = True
+            _poison_session(session, state["audio_failure"])
+
+
+def audio_diagnostics():
+    session = _lifecycle
+    result = session.audio_runtime.snapshot()
+    result.update({
+        "callback_registered": session.play_sound_callback_registered,
+        "sound_event_count": len(session.sound_events),
+    })
+    return result
+
+
+def _configure_debug_print_api(library):
+    if getattr(library, "_libsm64_debug_print_api_configured", False):
+        return
+    export_name = "sm64_register_debug_print_function"
+    if not hasattr(library, export_name):
+        raise MarioFeatureUnavailableError(
+            "Native debug messages are unavailable because the library is missing "
+            "{}. Live Mario remains usable.".format(export_name)
+        )
+    library.sm64_register_debug_print_function.argtypes = [
+        SM64DebugPrintFunctionPtr,
+    ]
+    library.sm64_register_debug_print_function.restype = None
+    library._libsm64_debug_print_api_configured = True
+
+
+def _register_debug_print_callback(session):
+    if session.debug_print_callback_registered:
+        return
+    _configure_debug_print_api(session.library)
+    owner_token = session.owner_token
+    generation = session.generation
+
+    def receive_debug(message):
+        try:
+            raw = message or b""
+            text = raw.decode("utf-8", errors="replace").rstrip()
+            if len(text) > 1024:
+                text = text[:1021] + "..."
+            record = NativeDebugMessage(
+                owner_token, generation, text, time.monotonic()
+            )
+            session.native_debug_log.append(record)
+            print("libsm64 native [{}] {}".format(generation, text))
+        except Exception:
+            return
+
+    callback = SM64DebugPrintFunctionPtr(receive_debug)
+    _native_call(
+        session, "sm64_register_debug_print_function", callback
+    )
+    session.debug_print_callback = callback
+    session.debug_print_callback_registered = True
+    session.last_debug_error = ""
+    session.optional_api_features.add("native_debug_callback")
+
+
+def _unregister_debug_print_callback(session):
+    if not session.debug_print_callback_registered:
+        session.debug_print_callback = None
+        return
+    _native_call(
+        session,
+        "sm64_register_debug_print_function",
+        SM64DebugPrintFunctionPtr(),
+    )
+    session.debug_print_callback_registered = False
+    session.debug_print_callback = None
+
+
+def _scene_debug_messages_requested(scene):
+    settings = getattr(scene, "libsm64", None) if scene is not None else None
+    return bool(
+        settings is not None
+        and getattr(settings, "enable_native_debug_messages", False)
+    )
+
+
+def apply_scene_debug_settings(scene):
+    """Enable or disable the retained callback for one committed generation."""
+    if not is_mario_running():
+        return False
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    requested = _scene_debug_messages_requested(scene)
+    try:
+        if requested:
+            _register_debug_print_callback(session)
+        else:
+            _unregister_debug_print_callback(session)
+    except MarioFeatureUnavailableError as exc:
+        session.last_debug_error = str(exc)
+        return False
+    except Exception as exc:
+        session.native_ownership_uncertain = True
+        _poison_session(
+            session,
+            "Native debug callback update failed; restart Blender: {}".format(exc),
+        )
+        session.last_debug_error = session.last_error
+        raise MarioLifecycleError(session.last_error) from exc
+    session.last_debug_error = ""
+    return True
+
+
+def _configure_directing_api(library):
+    if getattr(library, "_libsm64_directing_api_configured", False):
+        return
+    exports = (
+        "sm64_set_mario_health",
+        "sm64_mario_heal",
+        "sm64_mario_take_damage",
+        "sm64_mario_kill",
+        "sm64_set_mario_invincibility",
+    )
+    missing = [name for name in exports if not hasattr(library, name)]
+    if missing:
+        raise MarioFeatureUnavailableError(
+            "Performance directing is unavailable because the native library is "
+            "missing: {}. Live Mario remains usable.".format(", ".join(missing))
+        )
+    library.sm64_set_mario_health.argtypes = [ct.c_int32, ct.c_uint16]
+    library.sm64_set_mario_health.restype = None
+    library.sm64_mario_heal.argtypes = [ct.c_int32, ct.c_uint8]
+    library.sm64_mario_heal.restype = None
+    library.sm64_mario_take_damage.argtypes = [
+        ct.c_int32, ct.c_uint32, ct.c_uint32,
+        ct.c_float, ct.c_float, ct.c_float,
+    ]
+    library.sm64_mario_take_damage.restype = None
+    library.sm64_mario_kill.argtypes = [ct.c_int32]
+    library.sm64_mario_kill.restype = None
+    library.sm64_set_mario_invincibility.argtypes = [ct.c_int32, ct.c_int16]
+    library.sm64_set_mario_invincibility.restype = None
+    library._libsm64_directing_api_configured = True
+
+
+def _direct_mario(operation, export_name, arguments, details):
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    try:
+        _configure_directing_api(session.library)
+        _native_call(
+            session, export_name, int(session.mario_id), *arguments
+        )
+    except MarioFeatureUnavailableError as exc:
+        session.last_directing_error = str(exc)
+        raise
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native directing operation {} failed; restart Blender: {}".format(
+                operation, exc
+            ),
+        )
+        session.last_directing_error = session.last_error
+        raise MarioLifecycleError(session.last_error) from exc
+    session.optional_api_features.add("directing_controls")
+    session.last_directing_operation = {
+        "operation": operation,
+        "simulation_tick": max(0, int(tick_count)),
+        "mario_id": int(session.mario_id),
+        "details": dict(details),
+    }
+    session.last_directing_error = ""
+    return session.last_directing_operation
+
+
+def set_mario_health(health):
+    health = _require_integer_range("health", health, 0, 0xFFFF)
+    return _direct_mario(
+        "set_health", "sm64_set_mario_health", (health,), {"health": health}
+    )
+
+
+def heal_mario(heal_counter):
+    heal_counter = _require_integer_range(
+        "heal counter", heal_counter, 1, 0xFF
+    )
+    return _direct_mario(
+        "heal", "sm64_mario_heal", (heal_counter,),
+        {"heal_counter": heal_counter},
+    )
+
+
+def damage_mario(damage, subtype, blender_source_position):
+    damage = _require_integer_range("damage", damage, 1, 0xFFFFFFFF)
+    subtype = _require_integer_range("damage subtype", subtype, 0, 0xFFFFFFFF)
+    blender_source_position = tuple(blender_source_position)
+    _require_float3("damage source", blender_source_position)
+    native_source = blender_position_to_native(blender_source_position)
+    return _direct_mario(
+        "damage",
+        "sm64_mario_take_damage",
+        (damage, subtype, *native_source),
+        {
+            "damage": damage,
+            "subtype": subtype,
+            "blender_source": blender_source_position,
+            "native_source": native_source,
+        },
+    )
+
+
+def kill_mario():
+    return _direct_mario("kill", "sm64_mario_kill", (), {})
+
+
+def set_mario_invincibility(duration_ticks):
+    duration_ticks = _require_integer_range(
+        "invincibility duration", duration_ticks, 0, 0x7FFF
+    )
+    return _direct_mario(
+        "set_invincibility",
+        "sm64_set_mario_invincibility",
+        (duration_ticks,),
+        {"duration_ticks": duration_ticks},
+    )
+
+
+def _configure_collision_query_api(library):
+    if getattr(library, "_libsm64_collision_query_api_configured", False):
+        return
+    exports = (
+        "sm64_surface_find_floor_height",
+        "sm64_surface_find_water_level",
+        "sm64_surface_find_poison_gas_level",
+    )
+    missing = [name for name in exports if not hasattr(library, name)]
+    if missing:
+        raise MarioFeatureUnavailableError(
+            "Collision probes are unavailable because the native library is missing: "
+            "{}. Live Mario remains usable.".format(", ".join(missing))
+        )
+    library.sm64_surface_find_floor_height.argtypes = [
+        ct.c_float, ct.c_float, ct.c_float,
+    ]
+    library.sm64_surface_find_floor_height.restype = ct.c_float
+    library.sm64_surface_find_water_level.argtypes = [ct.c_float, ct.c_float]
+    library.sm64_surface_find_water_level.restype = ct.c_float
+    library.sm64_surface_find_poison_gas_level.argtypes = [
+        ct.c_float, ct.c_float,
+    ]
+    library.sm64_surface_find_poison_gas_level.restype = ct.c_float
+    library._libsm64_collision_query_api_configured = True
+
+
+def probe_collision(blender_position):
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    blender_position = tuple(blender_position)
+    _require_float3("collision probe position", blender_position)
+    native_position = blender_position_to_native(blender_position)
+    try:
+        _configure_collision_query_api(session.library)
+        with session.native_call_lock:
+            floor_height = float(session.library.sm64_surface_find_floor_height(
+                *native_position
+            ))
+            water_height = float(session.library.sm64_surface_find_water_level(
+                native_position[0], native_position[2]
+            ))
+            gas_height = float(
+                session.library.sm64_surface_find_poison_gas_level(
+                    native_position[0], native_position[2]
+                )
+            )
+    except MarioFeatureUnavailableError:
+        raise
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native collision probe failed; restart Blender: {}".format(exc),
+        )
+        raise MarioLifecycleError(session.last_error) from exc
+    for name, value in (
+        ("floor", floor_height), ("water", water_height), ("gas", gas_height)
+    ):
+        if not math.isfinite(value):
+            _poison_session(
+                session, "Native collision probe returned non-finite {} height".format(name)
+            )
+            raise MarioLifecycleError(session.last_error)
+    no_floor = math.isclose(
+        floor_height, NO_FLOOR_NATIVE_HEIGHT, rel_tol=0.0, abs_tol=1.0e-4
+    )
+    no_water = math.isclose(
+        water_height, float(ENVIRONMENT_DISABLED_NATIVE_LEVEL),
+        rel_tol=0.0, abs_tol=1.0e-4,
+    )
+    no_gas = math.isclose(
+        gas_height, float(ENVIRONMENT_DISABLED_NATIVE_LEVEL),
+        rel_tol=0.0, abs_tol=1.0e-4,
+    )
+    key = chunk_coordinate(blender_position, CHUNK_SIZE_BLENDER)
+    nearby_static = sum(
+        int(record.surface_count)
+        for chunk_key, record in session.native_surface_objects.items()
+        if max(abs(chunk_key[0] - key[0]), abs(chunk_key[1] - key[1])) <= 1
+        and record.state == SURFACE_CREATED
+    )
+    result = CollisionProbeResult(
+        blender_position=blender_position,
+        native_position=native_position,
+        floor_native_height=floor_height,
+        floor_blender_height=(
+            None if no_floor else native_height_to_blender(floor_height)
+        ),
+        no_floor=no_floor,
+        water_native_height=water_height,
+        water_blender_height=(
+            None if no_water else native_height_to_blender(water_height)
+        ),
+        gas_native_height=gas_height,
+        gas_blender_height=(
+            None if no_gas else native_height_to_blender(gas_height)
+        ),
+        chunk_key=key,
+        chunk_active=key in session.active_chunk_keys,
+        nearby_static_surface_count=nearby_static,
+        active_static_surface_count=int(session.active_surface_count),
+        active_moving_platform_surface_count=int(
+            session.moving_platform_surface_count
+        ),
+    )
+    session.last_collision_query = result
+    session.optional_api_features.add("collision_queries")
+    return result
+
+
+def probe_collision_at_cursor(scene=None):
+    scene = scene or bpy.context.scene
+    return probe_collision(tuple(float(value) for value in scene.cursor.location))
+
+
+def studio_diagnostics():
+    session = _lifecycle
+    state = None
+    if session.mario_created:
+        state = {
+            "mario_id": int(session.mario_id),
+            "position": tuple(float(value) for value in mario_state.position),
+            "velocity": tuple(float(value) for value in mario_state.velocity),
+            "health": int(mario_state.health),
+            "action": int(mario_state.action),
+            "animation_id": int(mario_state.animID),
+            "animation_frame": int(mario_state.animFrame),
+            "flags": int(mario_state.flags),
+            "particle_flags": int(mario_state.particleFlags),
+            "invincibility_timer": int(mario_state.invincTimer),
+        }
+    return {
+        "mario_state": state,
+        "start_mark_schema": START_MARK_SCHEMA_VERSION,
+        "start_mark_restoration_mode": session.start_mark_restoration_mode,
+        "moving_platform_count": len(session.moving_platform_objects),
+        "moving_platform_ids": tuple(sorted(
+            int(record.object_id)
+            for record in session.moving_platform_objects.values()
+            if record.object_id is not None
+        )),
+        "environment": environment_diagnostics(),
+        "cap_request_history": tuple(session.cap_request_history),
+        "audio": audio_diagnostics(),
+        "runtime_metadata_schema": RUNTIME_METADATA_SCHEMA_VERSION,
+        "debug_callback_registered": session.debug_print_callback_registered,
+        "last_debug_error": session.last_debug_error,
+        "debug_log": tuple(session.native_debug_log),
+        "last_collision_query": session.last_collision_query,
+        "last_directing_operation": session.last_directing_operation,
+        "last_directing_error": session.last_directing_error,
+    }
+
+
 def _make_tick_timer(session):
     def session_tick():
         if not _session_is_registered_owner(session):
@@ -879,6 +2246,11 @@ def collision_diagnostics():
         "active_chunks": len(snapshot["active_chunk_keys"]),
         "active_native_objects": snapshot["active_native_surface_object_count"],
         "active_surfaces": snapshot["active_surface_count"],
+        "moving_platforms": snapshot["moving_platform_count"],
+        "moving_platform_surfaces": snapshot["moving_platform_surface_count"],
+        "moving_platform_ids": snapshot["moving_platform_ids"],
+        "platform_moves": snapshot["platform_move_count"],
+        "last_platform_error": snapshot["last_platform_error"],
         "cache": snapshot["collision_stats"],
         "last_stream_seconds": _lifecycle.last_stream_seconds,
         "last_error": snapshot["last_collision_error"],
@@ -898,6 +2270,10 @@ def collision_status_message():
     )
     if _lifecycle.collision_changed_while_live:
         message += " | Scene collision changed: restart Live Mario to refresh active chunks"
+    if diagnostics["moving_platforms"]:
+        message += " | {} moving platform(s)".format(diagnostics["moving_platforms"])
+    if diagnostics["last_platform_error"]:
+        message += " | Platform warning: {}".format(diagnostics["last_platform_error"])
     return message
 
 
@@ -906,7 +2282,26 @@ def _collision_object_is_eligible(obj):
         getattr(obj, "type", None) == "MESH"
         and not obj.get("libsm64_is_bake", False)
         and not obj.get(LIVE_ROLE, "")
+        and collision_role(obj) == COLLISION_ROLE_STATIC
     )
+
+
+def _object_uses_material(obj, material):
+    """Use pointer identity; Blender 5.2 collection membership accepts names only."""
+    materials = getattr(getattr(obj, "data", None), "materials", ())
+    try:
+        target_pointer = int(material.as_pointer())
+    except (AttributeError, ReferenceError, TypeError):
+        return False
+    for candidate in materials:
+        if candidate is None:
+            continue
+        try:
+            if int(candidate.as_pointer()) == target_pointer:
+                return True
+        except (AttributeError, ReferenceError, TypeError):
+            continue
+    return False
 
 
 def _make_collision_update_handler(session):
@@ -917,6 +2312,12 @@ def _make_collision_update_handler(session):
         for update in getattr(depsgraph, "updates", ()):
             data = getattr(update, "id", None)
             if isinstance(data, bpy.types.Object):
+                if _moving_platform_object_is_eligible(data) and getattr(
+                    update, "is_updated_geometry", False
+                ):
+                    session.dirty_moving_platforms.add(
+                        _blender_object_identity(data)
+                    )
                 if _collision_object_is_eligible(data):
                     affected.append(data)
                 elif session.scene is not None:
@@ -935,11 +2336,21 @@ def _make_collision_update_handler(session):
                     obj for obj in session.scene.objects
                     if getattr(obj, "data", None) is data and _collision_object_is_eligible(obj)
                 )
+                session.dirty_moving_platforms.update(
+                    _blender_object_identity(obj) for obj in session.scene.objects
+                    if getattr(obj, "data", None) is data
+                    and _moving_platform_object_is_eligible(obj)
+                )
             elif isinstance(data, bpy.types.Material) and session.scene is not None:
                 affected.extend(
                     obj for obj in session.scene.objects
                     if _collision_object_is_eligible(obj)
-                    and data in getattr(getattr(obj, "data", None), "materials", ())
+                    and _object_uses_material(obj, data)
+                )
+                session.dirty_moving_platforms.update(
+                    _blender_object_identity(obj) for obj in session.scene.objects
+                    if _moving_platform_object_is_eligible(obj)
+                    and _object_uses_material(obj, data)
                 )
         if not affected:
             return
@@ -988,6 +2399,47 @@ def _surface_record_is_owned(session, record):
     )
 
 
+def _surface_registry_key(record):
+    if record.ownership_kind == SURFACE_KIND_STATIC_CHUNK:
+        return record.chunk_key
+    return record.object_key
+
+
+def _register_native_surface_id(session, record):
+    object_id = int(record.object_id)
+    existing = session.native_surface_id_registry.get(object_id)
+    if existing is not None:
+        session.native_ownership_uncertain = True
+        raise MarioLifecycleError(
+            "Native surface ID {} was reused while still owned by {}".format(
+                object_id, existing[0]
+            )
+        )
+    session.native_surface_id_registry[object_id] = (
+        record.ownership_kind,
+        _surface_registry_key(record),
+        record.owner_token,
+        record.generation,
+    )
+
+
+def _validate_native_surface_id_owner(session, record):
+    expected = (
+        record.ownership_kind,
+        _surface_registry_key(record),
+        record.owner_token,
+        record.generation,
+    )
+    actual = session.native_surface_id_registry.get(int(record.object_id))
+    if actual != expected:
+        session.native_ownership_uncertain = True
+        raise MarioLifecycleError(
+            "Native surface ID {} ownership is stale or ambiguous".format(
+                record.object_id
+            )
+        )
+
+
 def _create_native_surface_object(session, chunk):
     if not _session_is_registered_owner(session):
         raise MarioLifecycleError("Collision create rejected for a stale lifecycle generation")
@@ -1022,7 +2474,9 @@ def _create_native_surface_object(session, chunk):
     record.state = SURFACE_CREATE_ATTEMPTED
     try:
         _native_stage("before_surface_object_create {}".format(chunk.key))
-        object_id = int(session.library.sm64_surface_object_create(ct.byref(descriptor)))
+        object_id = int(_native_call(
+            session, "sm64_surface_object_create", ct.byref(descriptor)
+        ))
     except Exception as exc:
         record.state = SURFACE_FAILED
         record.diagnostic = str(exc)
@@ -1033,6 +2487,7 @@ def _create_native_surface_object(session, chunk):
         )
         raise
     record.object_id = object_id
+    _register_native_surface_id(session, record)
     record.state = SURFACE_CREATED
     session.surface_create_count += 1
     session.active_surface_count += chunk.surface_count
@@ -1054,12 +2509,15 @@ def _delete_native_surface_object(session, chunk_key, operation="delete"):
     if record.object_id is None:
         session.native_surface_objects.pop(chunk_key, None)
         return False
+    _validate_native_surface_id_owner(session, record)
     if record.state in (SURFACE_DELETE_ATTEMPTED, SURFACE_DELETED):
         raise MarioLifecycleError("Collision object {} would be deleted twice".format(record.object_id))
     record.state = SURFACE_DELETE_ATTEMPTED
     try:
         _native_stage("before_surface_object_delete {}".format(chunk_key))
-        session.library.sm64_surface_object_delete(record.object_id)
+        _native_call(
+            session, "sm64_surface_object_delete", record.object_id
+        )
         _native_stage("after_surface_object_delete {}".format(chunk_key))
     except Exception as exc:
         record.state = SURFACE_FAILED
@@ -1072,12 +2530,393 @@ def _delete_native_surface_object(session, chunk_key, operation="delete"):
         )
         raise
     record.state = SURFACE_DELETED
+    session.native_surface_id_registry.pop(int(record.object_id), None)
     session.surface_delete_count += 1
     session.active_surface_count -= record.surface_count
     # IDs may be reused by upstream.  Remove successful ownership immediately
     # so this generation can never delete the old numeric ID twice.
     session.native_surface_objects.pop(chunk_key, None)
     return True
+
+
+def _blender_object_identity(obj):
+    original = getattr(obj, "original", obj)
+    session_uid = getattr(original, "session_uid", None)
+    if session_uid is not None:
+        return ("UID", int(session_uid))
+    return ("PTR", int(original.as_pointer()))
+
+
+def _moving_platform_object_is_eligible(obj):
+    if not (
+        getattr(obj, "type", None) == "MESH"
+        and not obj.get("libsm64_is_bake", False)
+        and not obj.get(LIVE_ROLE, "")
+        and collision_role(obj) == COLLISION_ROLE_MOVING_PLATFORM
+    ):
+        return False
+    try:
+        if obj.hide_get():
+            return False
+    except Exception:
+        pass
+    return not getattr(obj, "hide_viewport", False)
+
+
+def _moving_platform_candidates(session):
+    if session.scene is None:
+        return {}
+    return {
+        _blender_object_identity(obj): obj
+        for obj in session.scene.collection.all_objects
+        if _moving_platform_object_is_eligible(obj)
+    }
+
+
+def _snapshot_collision_roles(session):
+    session.initial_collision_roles = {
+        _blender_object_identity(obj): collision_role(obj)
+        for obj in session.scene.collection.all_objects
+        if getattr(obj, "type", None) == "MESH"
+        and not obj.get("libsm64_is_bake", False)
+        and not obj.get(LIVE_ROLE, "")
+    }
+
+
+def _moving_platform_surface_type(mesh, triangle):
+    default = int(COLLISION_TYPES["SURFACE_DEFAULT"])
+    material_index = int(triangle.material_index)
+    materials = getattr(mesh, "materials", ())
+    if 0 <= material_index < len(materials):
+        material = materials[material_index]
+        collision_name = getattr(material, "collision_type_simple", None) if material else None
+        if collision_name is not None:
+            return int(COLLISION_TYPES.get(collision_name, default))
+    return default
+
+
+def _extract_moving_platform_geometry(obj, evaluated, depsgraph, transform):
+    """Build object-local native surfaces with evaluated scale baked once."""
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        mesh.calc_loop_triangles()
+        terrain = int(_object_terrain(obj))
+        scale = transform.blender_scale
+        records = []
+        digest = hashlib.sha256()
+        digest.update(b"libsm64-moving-platform-v2")
+        native_by_index = []
+        for vertex in mesh.vertices:
+            coordinate = vertex.co
+            scaled_local = (
+                float(coordinate.x) * scale[0],
+                float(coordinate.y) * scale[1],
+                float(coordinate.z) * scale[2],
+            )
+            mapped = blender_local_vector_to_native(scaled_local, SM64_SCALE_FACTOR)
+            checked = []
+            for value in mapped:
+                integer, valid = _checked_int32_coordinate(value)
+                if not valid:
+                    raise OverflowError(
+                        "Moving Platform {!r} exceeds signed 32-bit native coordinates".format(
+                            obj.name
+                        )
+                    )
+                checked.append(integer)
+            native_by_index.append(tuple(checked))
+
+        # Fingerprint evaluated polygon geometry independently of Blender's
+        # transient loop-triangle order/diagonal choice for planar n-gons.
+        polygon_fingerprints = []
+        for polygon in mesh.polygons:
+            coordinates = tuple(native_by_index[index] for index in polygon.vertices)
+            rotations = tuple(
+                coordinates[index:] + coordinates[:index]
+                for index in range(len(coordinates))
+            )
+            canonical = min(rotations) if rotations else ()
+            material_index = int(polygon.material_index)
+            surface_type = int(COLLISION_TYPES["SURFACE_DEFAULT"])
+            materials = getattr(mesh, "materials", ())
+            if 0 <= material_index < len(materials):
+                material = materials[material_index]
+                collision_name = (
+                    getattr(material, "collision_type_simple", None)
+                    if material else None
+                )
+                if collision_name is not None:
+                    surface_type = int(COLLISION_TYPES.get(collision_name, surface_type))
+            polygon_fingerprints.append((surface_type, terrain, canonical))
+        for surface_type, polygon_terrain, coordinates in sorted(polygon_fingerprints):
+            digest.update(struct.pack("<hH", surface_type, polygon_terrain))
+            digest.update(struct.pack("<I", len(coordinates)))
+            for vertex in coordinates:
+                digest.update(struct.pack("<iii", *vertex))
+
+        for triangle in mesh.loop_triangles:
+            native_vertices = [native_by_index[index] for index in triangle.vertices]
+            surface_type = _moving_platform_surface_type(mesh, triangle)
+            record = (surface_type, 0, terrain, tuple(native_vertices))
+            records.append(record)
+        surfaces = (SM64Surface * len(records))()
+        for surface_index, record in enumerate(records):
+            surface_type, force, terrain, vertices = record
+            surface = surfaces[surface_index]
+            surface.type = surface_type
+            surface.force = force
+            surface.terrain = terrain
+            for vertex_index, vertex in enumerate(vertices):
+                for axis_index, coordinate in enumerate(vertex):
+                    surface.vertices[vertex_index][axis_index] = coordinate
+        return surfaces, digest.hexdigest()
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _ctypes_platform_transform(transform):
+    native = SM64ObjectTransform()
+    native.position[:] = transform.position
+    native.eulerRotation[:] = transform.euler_rotation_degrees
+    return native
+
+
+def _evaluate_moving_platform(obj, depsgraph):
+    evaluated = obj.evaluated_get(depsgraph)
+    transform = blender_matrix_to_native_transform(
+        evaluated.matrix_world, SM64_SCALE_FACTOR, origin_offset
+    )
+    surfaces, fingerprint = _extract_moving_platform_geometry(
+        obj, evaluated, depsgraph, transform
+    )
+    return transform, surfaces, fingerprint
+
+
+def _create_moving_platform_object(session, obj, depsgraph):
+    object_key = _blender_object_identity(obj)
+    if object_key in session.moving_platform_objects:
+        raise MarioLifecycleError("Moving Platform already has a native owner")
+    transform, surfaces, fingerprint = _evaluate_moving_platform(obj, depsgraph)
+    surface_count = len(surfaces)
+    if surface_count <= 0:
+        raise ValueError("Moving Platform {!r} has no collision triangles".format(obj.name))
+    record = MovingPlatformOwnership(
+        object_key=object_key,
+        object_name=obj.name,
+        owner_token=session.owner_token,
+        generation=session.generation,
+        surface_count=surface_count,
+        geometry_fingerprint=fingerprint,
+        initial_scale=transform.blender_scale,
+        previous_transform=transform,
+        current_transform=transform,
+        creation_order=session.surface_create_count + 1,
+    )
+    session.moving_platform_objects[object_key] = record
+    descriptor = SM64SurfaceObject()
+    descriptor.transform = _ctypes_platform_transform(transform)
+    descriptor.surfaceCount = surface_count
+    descriptor.surfaces = ct.cast(surfaces, ct.POINTER(SM64Surface))
+    record.state = SURFACE_CREATE_ATTEMPTED
+    try:
+        _native_stage("before_moving_platform_create {}".format(obj.name))
+        record.object_id = int(_native_call(
+            session, "sm64_surface_object_create", ct.byref(descriptor)
+        ))
+        _native_stage("after_moving_platform_create {}".format(obj.name))
+        _register_native_surface_id(session, record)
+    except Exception as exc:
+        record.state = SURFACE_FAILED
+        record.diagnostic = str(exc)
+        session.last_platform_error = (
+            "Moving Platform {!r} create failed: {}".format(obj.name, exc)
+        )
+        raise
+    record.state = SURFACE_CREATED
+    session.surface_create_count += 1
+    session.moving_platform_surface_count += surface_count
+    return record
+
+
+def _moving_platform_record_is_owned(session, record):
+    return bool(
+        record.owner_token == session.owner_token
+        and record.generation == session.generation
+        and session.moving_platform_objects.get(record.object_key) is record
+    )
+
+
+def _delete_moving_platform_object(session, object_key, operation="delete"):
+    record = session.moving_platform_objects.get(object_key)
+    if record is None:
+        return False
+    if not _moving_platform_record_is_owned(session, record):
+        session.native_ownership_uncertain = True
+        raise MarioLifecycleError("Moving Platform delete rejected for stale ownership")
+    if record.object_id is None:
+        session.moving_platform_objects.pop(object_key, None)
+        return False
+    _validate_native_surface_id_owner(session, record)
+    if record.state in (SURFACE_DELETE_ATTEMPTED, SURFACE_DELETED):
+        raise MarioLifecycleError(
+            "Moving Platform {} would be deleted twice".format(record.object_id)
+        )
+    record.state = SURFACE_DELETE_ATTEMPTED
+    try:
+        _native_stage("before_moving_platform_delete {}".format(record.object_name))
+        _native_call(
+            session, "sm64_surface_object_delete", record.object_id
+        )
+        _native_stage("after_moving_platform_delete {}".format(record.object_name))
+    except Exception as exc:
+        record.state = SURFACE_FAILED
+        record.diagnostic = str(exc)
+        session.native_ownership_uncertain = True
+        session.last_platform_error = (
+            "Moving Platform {!r} {} failed; ownership is uncertain: {}".format(
+                record.object_name, operation, exc
+            )
+        )
+        raise
+    record.state = SURFACE_DELETED
+    session.native_surface_id_registry.pop(int(record.object_id), None)
+    session.surface_delete_count += 1
+    session.moving_platform_surface_count -= record.surface_count
+    session.moving_platform_objects.pop(object_key, None)
+    return True
+
+
+def _platform_transform_changed(previous, current):
+    position_tolerance = max(1.0, abs(float(SM64_SCALE_FACTOR))) * PLATFORM_TRANSFORM_TOLERANCE
+    if any(
+        abs(left - right) > position_tolerance
+        for left, right in zip(previous.position, current.position)
+    ):
+        return True
+    return any(
+        abs(left - right) > PLATFORM_ROTATION_TOLERANCE
+        for left, right in zip(previous.rotation_matrix, current.rotation_matrix)
+    )
+
+
+def _platform_scale_changed(initial, current):
+    return any(
+        not math.isclose(left, right, rel_tol=1e-7, abs_tol=1e-7)
+        for left, right in zip(initial, current)
+    )
+
+
+def _disable_moving_platform(session, record, message):
+    _delete_moving_platform_object(session, record.object_key, operation="disable")
+    session.disabled_moving_platforms[record.object_key] = message
+    session.last_platform_error = message
+
+
+def _initialize_moving_platforms(session):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for object_key, obj in sorted(
+        _moving_platform_candidates(session).items(), key=lambda item: item[1].name
+    ):
+        try:
+            _create_moving_platform_object(session, obj, depsgraph)
+        except (ValueError, OverflowError) as exc:
+            message = "Moving Platform {!r} disabled: {}".format(obj.name, exc)
+            session.disabled_moving_platforms[object_key] = message
+            session.last_platform_error = message
+        except Exception as exc:
+            _poison_session(session, session.last_platform_error or str(exc))
+            raise MarioLifecycleError(session.last_error) from exc
+
+
+def _update_moving_platforms(session):
+    """Sample evaluated platform state and move native objects before Mario tick."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    candidates = _moving_platform_candidates(session)
+    for object_key in tuple(session.moving_platform_objects):
+        if object_key not in candidates:
+            _delete_moving_platform_object(session, object_key, operation="removed")
+    for object_key, obj in sorted(candidates.items(), key=lambda item: item[1].name):
+        if object_key in session.disabled_moving_platforms:
+            continue
+        record = session.moving_platform_objects.get(object_key)
+        if record is None:
+            if session.initial_collision_roles.get(object_key) == COLLISION_ROLE_STATIC:
+                message = (
+                    "Moving Platform {!r} was Static when the session began; restart "
+                    "Live Mario to change its collision role safely".format(obj.name)
+                )
+                session.disabled_moving_platforms[object_key] = message
+                session.last_platform_error = message
+                continue
+            try:
+                _create_moving_platform_object(session, obj, depsgraph)
+            except (ValueError, OverflowError) as exc:
+                message = "Moving Platform {!r} disabled: {}".format(obj.name, exc)
+                session.disabled_moving_platforms[object_key] = message
+                session.last_platform_error = message
+            except Exception as exc:
+                _poison_session(session, session.last_platform_error or str(exc))
+                raise MarioLifecycleError(session.last_error) from exc
+            continue
+        try:
+            evaluated = obj.evaluated_get(depsgraph)
+            transform = blender_matrix_to_native_transform(
+                evaluated.matrix_world, SM64_SCALE_FACTOR, origin_offset
+            )
+            fingerprint = record.geometry_fingerprint
+            if object_key in session.dirty_moving_platforms:
+                _surfaces, fingerprint = _extract_moving_platform_geometry(
+                    obj, evaluated, depsgraph, transform
+                )
+        except (ValueError, OverflowError) as exc:
+            _disable_moving_platform(
+                session, record,
+                "Moving Platform {!r} disabled until session restart: {}".format(
+                    obj.name, exc
+                ),
+            )
+            continue
+        if _platform_scale_changed(record.initial_scale, transform.blender_scale):
+            _disable_moving_platform(
+                session, record,
+                "Moving Platform {!r} disabled until session restart: animated scale is unsupported".format(
+                    obj.name
+                ),
+            )
+            continue
+        if fingerprint != record.geometry_fingerprint:
+            _disable_moving_platform(
+                session, record,
+                "Moving Platform {!r} disabled until session restart: evaluated geometry changed".format(
+                    obj.name
+                ),
+            )
+            continue
+        session.dirty_moving_platforms.discard(object_key)
+        record.current_transform = transform
+        if not _platform_transform_changed(record.previous_transform, transform):
+            continue
+        native_transform = _ctypes_platform_transform(transform)
+        try:
+            _native_stage("before_moving_platform_move {}".format(obj.name))
+            _native_call(
+                session,
+                "sm64_surface_object_move",
+                record.object_id,
+                ct.byref(native_transform),
+            )
+            _native_stage("after_moving_platform_move {}".format(obj.name))
+        except Exception as exc:
+            record.state = SURFACE_FAILED
+            record.diagnostic = str(exc)
+            session.last_platform_error = (
+                "Moving Platform {!r} move failed: {}".format(obj.name, exc)
+            )
+            _poison_session(session, session.last_platform_error)
+            raise MarioLifecycleError(session.last_error) from exc
+        record.previous_transform = transform
+        record.last_updated_tick = tick_count
+        session.platform_move_count += 1
 
 
 def _rollback_surface_creates(session, created_keys):
@@ -1186,6 +3025,9 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
     session = _new_lifecycle()
     _lifecycle = session
     _publish_session(session)
+    # Retain only the validated bytes for optional mid-session audio startup.
+    # The user-selected filesystem path is never stored in lifecycle state.
+    session.rom_image = rom_bytes
     _invalidate_mesh_coordinate_cache()
 
     SM64_SCALE_FACTOR = scale
@@ -1226,10 +3068,30 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         session.global_init_attempted = True
         _lifecycle_log(session, "global init started")
         _native_stage("before_global_init")
-        session.library.sm64_global_init(rom_chars.from_buffer(rom_bytes), texture_buff)
+        _native_call(
+            session,
+            "sm64_global_init",
+            rom_chars.from_buffer(rom_bytes),
+            texture_buff,
+        )
         _native_stage("after_global_init")
         session.global_initialized = True
         _lifecycle_log(session, "global init succeeded")
+        if _scene_debug_messages_requested(session.scene):
+            try:
+                _register_debug_print_callback(session)
+            except MarioFeatureUnavailableError as exc:
+                # Diagnostics are optional. An otherwise-compatible artifact
+                # may omit this callback without blocking Live Mario.
+                session.last_debug_error = str(exc)
+                _lifecycle_log(session, "native debug callback unavailable")
+            except Exception as exc:
+                session.native_ownership_uncertain = True
+                raise MarioLifecycleError(
+                    "Native debug callback registration failed; restart Blender: {}".format(
+                        exc
+                    )
+                ) from exc
         initialize_all_data(texture_buff)
 
         # Dynamic surface objects carry all Studio scene collision.  Keep the
@@ -1237,16 +3099,22 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         # geometry is represented in both systems.
         empty_surfaces = (SM64Surface * 0)()
         _native_stage("before_static_surface_load")
-        session.library.sm64_static_surfaces_load(empty_surfaces, 0)
+        _native_call(
+            session, "sm64_static_surfaces_load", empty_surfaces, 0
+        )
         _native_stage("after_static_surface_load")
         print("Preparing nearby streamed collision\u2026")
+        _snapshot_collision_roles(session)
         _initialize_streamed_collision(session, tuple(original_cursor_pos))
+        _initialize_moving_platforms(session)
 
         session.mario_create_attempted = True
         _lifecycle_log(session, "Mario create started")
         _native_stage("before_mario_create")
         print("Starting Live Mario\u2026")
-        mario_id = int(session.library.sm64_mario_create(0.0, 0.0, 0.0))
+        mario_id = int(_native_call(
+            session, "sm64_mario_create", 0.0, 0.0, 0.0
+        ))
         _native_stage("after_mario_create")
         if mario_id < 0:
             _lifecycle_log(session, "Mario create failed")
@@ -1255,6 +3123,7 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         session.mario_created = True
         sm64_mario_id = mario_id
         _lifecycle_log(session, "Mario create succeeded")
+        _apply_environment_after_mario_create(session)
 
         session.live_object = _create_live_object()
         session.live_object_name = session.live_object.name
@@ -1271,6 +3140,9 @@ def insert_mario(rom_path: str, scale: float, camera_follow: bool):
         tick_count = 0
         session.session_committed = True
         session.control_state = LIVE_IDLE
+        requested_audio, _volume, _muted = _scene_audio_request(session.scene)
+        if requested_audio:
+            start_live_audio(session)
         _install_collision_update_handler(session)
         _install_tick_timer(session)
         return None
@@ -1364,6 +3236,32 @@ def is_mario_running():
     )
 
 
+def require_owned_mario_operation(session=None, allowed_states=None):
+    """Return an exactly owned live session or reject before any native call."""
+    session = session or _lifecycle
+    if session is not _lifecycle or not _session_is_registered_owner(session):
+        raise MarioLifecycleError("Native Mario operation rejected for stale ownership")
+    if not session.session_committed:
+        raise MarioLifecycleError("Native Mario operation rejected before session commit")
+    if not session.library_loaded or session.library is None:
+        raise MarioLifecycleError("Native Mario operation rejected without a loaded library")
+    if not session.global_initialized:
+        raise MarioLifecycleError("Native Mario operation rejected without global initialization")
+    if not session.mario_created or session.mario_id < 0:
+        raise MarioLifecycleError("Native Mario operation rejected without an owned Mario")
+    if session.native_ownership_uncertain or session.control_state == POISONED:
+        raise MarioLifecycleError("Native Mario operation rejected for a poisoned session")
+    if session.shutdown_in_progress or session.shutdown_complete:
+        raise MarioLifecycleError("Native Mario operation rejected during shutdown")
+    if allowed_states is not None and session.control_state not in allowed_states:
+        raise MarioLifecycleError(
+            "Native Mario operation is unavailable while Studio is {}".format(
+                session.control_state
+            )
+        )
+    return session
+
+
 def has_owned_native_session():
     session = _lifecycle
     return bool(
@@ -1419,37 +3317,64 @@ def _disable_keyboard_control():
 
 
 def capture_mario_starting_mark():
-    """Capture the public simulation state needed for a safe fresh Mario spawn."""
-    if not is_mario_running():
-        raise RuntimeError("Live Mario is unavailable")
-    return {
-        "position": (
+    """Capture one immutable same-tick snapshot of modern public Mario state."""
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING, BAKING)
+    )
+    return MarioStartMark(
+        schema_version=START_MARK_SCHEMA_VERSION,
+        owner_token=session.owner_token,
+        lifecycle_generation=session.generation,
+        position=(
             float(mario_state.position[0]),
             float(mario_state.position[1]),
             float(mario_state.position[2]),
         ),
-        "velocity": (
+        velocity=(
             float(mario_state.velocity[0]),
             float(mario_state.velocity[1]),
             float(mario_state.velocity[2]),
         ),
-        "face_angle": float(mario_state.faceAngle),
-        "health": int(mario_state.health),
-    }
+        face_angle=float(mario_state.faceAngle),
+        forward_velocity=float(mario_state.forwardVelocity),
+        health=int(mario_state.health),
+        action=int(mario_state.action),
+        anim_id=int(mario_state.animID),
+        anim_frame=int(mario_state.animFrame),
+        flags=int(mario_state.flags),
+        particle_flags=int(mario_state.particleFlags),
+        invincibility_timer=int(mario_state.invincTimer),
+    )
+
+
+def _validate_start_mark_for_session(mark, session=None):
+    session = session or _lifecycle
+    if not isinstance(mark, MarioStartMark):
+        raise ValueError(
+            "Start Mark uses an unsupported legacy schema; set a new Start Mark"
+        )
+    # Re-run validation defensively in case a deserializer bypassed __init__.
+    mark.__post_init__()
+    if mark.owner_token != session.owner_token:
+        raise MarioLifecycleError("Start Mark belongs to a different runtime owner")
+    if mark.lifecycle_generation != session.generation:
+        raise MarioLifecycleError("Start Mark belongs to a retired lifecycle generation")
+    return mark
 
 
 def _valid_persistent_start_mark(session=None):
     """Return this generation's mark data, or None for stale/unowned state."""
     session = session or _lifecycle
-    stored = session.persistent_start_mark
-    if not isinstance(stored, dict):
+    mark = session.persistent_start_mark
+    if not isinstance(mark, MarioStartMark):
         return None
-    if stored.get("owner_token") != session.owner_token:
+    if mark.owner_token != session.owner_token:
         return None
-    if stored.get("generation") != session.generation:
+    if mark.lifecycle_generation != session.generation:
         return None
-    mark = stored.get("mark")
-    if not isinstance(mark, dict) or "position" not in mark:
+    try:
+        _validate_start_mark_for_session(mark, session)
+    except (MarioLifecycleError, ValueError):
         return None
     if session is not _lifecycle or not is_mario_running():
         return None
@@ -1467,11 +3392,7 @@ def set_persistent_start_mark():
     if not is_mario_running() or session.control_state != LIVE_IDLE:
         raise RuntimeError("Live Mario is not ready to set a Start Mark")
     mark = capture_mario_starting_mark()
-    session.persistent_start_mark = {
-        "owner_token": session.owner_token,
-        "generation": session.generation,
-        "mark": mark,
-    }
+    session.persistent_start_mark = mark
     return mark
 
 
@@ -1480,7 +3401,17 @@ def clear_persistent_start_mark(session=None):
     (session or _lifecycle).persistent_start_mark = None
 
 
-def reset_to_persistent_start_mark():
+def _selected_start_mark_restoration_mode(session):
+    settings = getattr(session.scene, "libsm64", None)
+    mode = getattr(settings, "start_mark_restoration_mode", None)
+    if mode not in START_MARK_RESTORATION_MODES:
+        mode = session.start_mark_restoration_mode
+    if mode not in START_MARK_RESTORATION_MODES:
+        mode = START_MARK_PERFORMANCE
+    return mode
+
+
+def reset_to_persistent_start_mark(restoration_mode=None):
     """Safely recreate Live Mario at this generation's persistent mark."""
     session = _lifecycle
     if recorder.active or session.control_state == RECORDING:
@@ -1490,10 +3421,13 @@ def reset_to_persistent_start_mark():
     mark = _valid_persistent_start_mark(session)
     if mark is None:
         raise RuntimeError("Start Mark unavailable")
+    mode = restoration_mode or _selected_start_mark_restoration_mode(session)
+    if mode not in START_MARK_RESTORATION_MODES:
+        raise ValueError("Unknown Start Mark restoration mode: {}".format(mode))
 
     session.control_state = RESETTING
     try:
-        restore_mario_starting_mark(mark)
+        restore_mario_starting_mark(mark, mode)
         session.recording_tick_origin = None
         session.control_state = LIVE_IDLE
         resume_mario_for_recording()
@@ -1504,22 +3438,103 @@ def reset_to_persistent_start_mark():
     return mark
 
 
-def restore_mario_starting_mark(mark):
-    """Recreate libsm64 Mario at a mark, clearing all transient internal state.
+def _restore_supported_start_mark_state(session, mark, restoration_mode):
+    """Apply supported setters in the order validated by the Phase-3A tests."""
+    mario_id = session.mario_id
+    if restoration_mode == START_MARK_PERFORMANCE:
+        _native_call(session, "sm64_set_mario_action", mario_id, mark.action)
+        _native_call(session, "sm64_set_mario_animation", mario_id, mark.anim_id)
+        _native_call(session, "sm64_set_mario_anim_frame", mario_id, mark.anim_frame)
+        _native_call(session, "sm64_set_mario_state", mario_id, mark.flags)
+    _native_call(session, "sm64_set_mario_position", mario_id, *mark.position)
+    _native_call(session, "sm64_set_mario_faceangle", mario_id, mark.face_angle)
+    _native_call(session, "sm64_set_mario_velocity", mario_id, *mark.velocity)
+    _native_call(
+        session, "sm64_set_mario_forward_velocity", mario_id,
+        mark.forward_velocity,
+    )
+    _native_call(session, "sm64_set_mario_health", mario_id, mark.health)
+    _native_call(
+        session, "sm64_set_mario_invincibility", mario_id,
+        mark.invincibility_timer,
+    )
 
-    The bundled libsm64 exposes create/delete but no complete state setter. A
-    fresh instance is therefore safer than moving only Blender geometry or
-    attempting to mutate the output state structure.
-    """
+
+def _start_mark_restoration_result(mark, restoration_mode):
+    expected = {
+        "position": mark.position,
+        "velocity": mark.velocity,
+        "face_angle": mark.face_angle,
+        "forward_velocity": mark.forward_velocity,
+        "health": mark.health,
+        "invincibility_timer": mark.invincibility_timer,
+    }
+    if restoration_mode == START_MARK_PERFORMANCE:
+        expected.update({
+            "action": mark.action,
+            "anim_id": mark.anim_id,
+            "anim_frame": mark.anim_frame,
+            "flags": mark.flags,
+        })
+    actual = {
+        "position": tuple(float(value) for value in mario_state.position),
+        "velocity": tuple(float(value) for value in mario_state.velocity),
+        "face_angle": float(mario_state.faceAngle),
+        "forward_velocity": float(mario_state.forwardVelocity),
+        "health": int(mario_state.health),
+        "action": int(mario_state.action),
+        "anim_id": int(mario_state.animID),
+        "anim_frame": int(mario_state.animFrame),
+        "flags": int(mario_state.flags),
+        "invincibility_timer": int(mario_state.invincTimer),
+    }
+    fidelity = {}
+    for name, target in expected.items():
+        observed = actual[name]
+        if isinstance(target, tuple):
+            exact = observed == target
+            approximate = all(
+                math.isclose(left, right, rel_tol=1e-6, abs_tol=1e-4)
+                for left, right in zip(observed, target)
+            )
+        elif isinstance(target, float):
+            exact = observed == target
+            approximate = math.isclose(
+                observed, target, rel_tol=1e-6, abs_tol=1e-4
+            )
+        else:
+            exact = observed == target
+            approximate = exact
+        fidelity[name] = "exact" if exact else (
+            "approximate" if approximate else "changed_after_neutral_tick"
+        )
+    return {
+        "schema_version": START_MARK_SCHEMA_VERSION,
+        "mode": restoration_mode,
+        "fidelity": fidelity,
+        "observed_only": START_MARK_OBSERVED_ONLY_FIELDS,
+    }
+
+
+def restore_mario_starting_mark(mark, restoration_mode=START_MARK_PERFORMANCE):
+    """Safely recreate Mario, then restore every ABI-supported mark field."""
     global sm64_mario_id, tick_count
 
-    session = _lifecycle
-    if not is_mario_running():
-        raise RuntimeError("Live Mario is unavailable")
-    spawn = tuple(float(value) for value in mark["position"])
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RESETTING, BAKING)
+    )
+    mark = _validate_start_mark_for_session(mark, session)
+    if restoration_mode not in START_MARK_RESTORATION_MODES:
+        raise ValueError("Unknown Start Mark restoration mode: {}".format(restoration_mode))
+    # Optional capability validation happens before deleting the current Mario,
+    # so a missing export is recoverable and cannot disturb native ownership.
+    _configure_start_mark_api(session.library)
+    session.optional_api_features.add("better_start_marks")
+    session.start_mark_restoration_mode = restoration_mode
+    spawn = tuple(float(value) for value in mark.position)
     old_id = session.mario_id
     try:
-        session.library.sm64_mario_delete(old_id)
+        _native_call(session, "sm64_mario_delete", old_id)
     except Exception as exc:
         session.mario_delete_attempted = True
         _poison_session(
@@ -1531,7 +3546,9 @@ def restore_mario_starting_mark(mark):
     session.mario_id = -1
     sm64_mario_id = -1
     try:
-        replacement_id = int(session.library.sm64_mario_create(*spawn))
+        replacement_id = int(_native_call(
+            session, "sm64_mario_create", *spawn
+        ))
     except Exception as exc:
         session.native_ownership_uncertain = True
         _poison_session(
@@ -1549,11 +3566,13 @@ def restore_mario_starting_mark(mark):
     session.mario_created = True
     sm64_mario_id = replacement_id
     try:
-        session.library.sm64_set_mario_faceangle(
-            session.mario_id, float(mark["face_angle"])
-        )
+        _restore_supported_start_mark_state(session, mark, restoration_mode)
+        _apply_environment_after_mario_create(session)
         _clear_transient_input_state(session)
-        session.library.sm64_mario_tick(
+        _update_moving_platforms(session)
+        _native_call(
+            session,
+            "sm64_mario_tick",
             session.mario_id,
             ct.byref(mario_inputs),
             ct.byref(mario_state),
@@ -1566,6 +3585,9 @@ def restore_mario_starting_mark(mark):
             "restart Blender: {}".format(exc),
         )
         raise MarioLifecycleError(session.last_error)
+    session.last_start_mark_restoration = _start_mark_restoration_result(
+        mark, restoration_mode
+    )
     tick_count = 1
 
     live_object = get_live_mario_object()
@@ -1705,25 +3727,43 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             original_cursor_pos[1],
             original_cursor_pos[2]
         )
+    _lifecycle_log(session, "audio stop invoked before native teardown")
+    if not session.audio_runtime.stop_worker():
+        errors.append(session.audio_runtime.audio_failure)
+        session.native_ownership_uncertain = True
+    if session.play_sound_callback_registered and not session.native_ownership_uncertain:
+        try:
+            _unregister_play_sound_callback(session)
+        except Exception as exc:
+            errors.append("Sound callback cleanup failed: {}".format(exc))
+            session.native_ownership_uncertain = True
     try:
         surface_cleanup_safe = not session.native_ownership_uncertain
         if session.native_ownership_uncertain:
             errors.append("Surface-object cleanup skipped because native ownership is already uncertain")
             _lifecycle_log(session, "surface cleanup skipped: native ownership is uncertain")
-        elif session.native_surface_objects:
+        elif session.native_surface_objects or session.moving_platform_objects:
             if not (session.library_loaded and session.global_initialized and session.library):
                 errors.append("Surface-object state is inconsistent; native cleanup skipped")
                 session.native_ownership_uncertain = True
                 surface_cleanup_safe = False
             else:
                 owned_records = sorted(
-                    tuple(session.native_surface_objects.values()),
+                    tuple(session.native_surface_objects.values())
+                    + tuple(session.moving_platform_objects.values()),
                     key=lambda record: record.creation_order,
                     reverse=True,
                 )
                 for record in owned_records:
                     try:
-                        _delete_native_surface_object(session, record.chunk_key, operation="shutdown")
+                        if record.ownership_kind == SURFACE_KIND_MOVING_PLATFORM:
+                            _delete_moving_platform_object(
+                                session, record.object_key, operation="shutdown"
+                            )
+                        else:
+                            _delete_native_surface_object(
+                                session, record.chunk_key, operation="shutdown"
+                            )
                     except Exception as exc:
                         errors.append("Surface object delete failed: {}".format(exc))
                         surface_cleanup_safe = False
@@ -1732,6 +3772,8 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
         if surface_cleanup_safe:
             session.active_chunk_keys.clear()
             session.active_surface_count = 0
+            session.moving_platform_surface_count = 0
+            session.native_surface_id_registry.clear()
 
         if not surface_cleanup_safe:
             if session.mario_created:
@@ -1745,7 +3787,9 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
                 session.mario_delete_attempted = True
                 _lifecycle_log(session, "Mario delete invoked")
                 try:
-                    session.library.sm64_mario_delete(session.mario_id)
+                    _native_call(
+                        session, "sm64_mario_delete", session.mario_id
+                    )
                     session.mario_created = False
                     session.mario_id = -1
                 except Exception as exc:
@@ -1754,6 +3798,20 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
             _lifecycle_log(session, "Mario delete skipped: deletion was already attempted")
         else:
             _lifecycle_log(session, "Mario delete skipped: no Mario instance was created")
+
+        # Keep native debug reporting alive through Mario/surface cleanup, then
+        # sever the retained Python callback before global memory is released.
+        if session.debug_print_callback_registered:
+            if session.native_ownership_uncertain:
+                errors.append(
+                    "Debug callback cleanup skipped because native ownership is uncertain"
+                )
+            else:
+                try:
+                    _unregister_debug_print_callback(session)
+                except Exception as exc:
+                    errors.append("Debug callback cleanup failed: {}".format(exc))
+                    session.native_ownership_uncertain = True
 
         if session.global_initialized and not session.global_terminate_attempted:
             if session.native_ownership_uncertain:
@@ -1769,7 +3827,7 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
                 session.global_terminate_attempted = True
                 _lifecycle_log(session, "global terminate invoked")
                 try:
-                    session.library.sm64_global_terminate()
+                    _native_call(session, "sm64_global_terminate")
                     session.global_initialized = False
                 except Exception as exc:
                     errors.append("Global termination failed: {}".format(exc))
@@ -1801,6 +3859,11 @@ def stop_tick_mario(_session=None, _cleanup_rejected=True):
         session.pending_transition_state = "shutdown"
         session.library = None
         session.library_loaded = False
+        session.rom_image = None
+        session.play_sound_callback = None
+        session.play_sound_callback_registered = False
+        if not session.debug_print_callback_registered:
+            session.debug_print_callback = None
         session.session_committed = False
         session.shutdown_in_progress = False
         session.shutdown_complete = True
@@ -1832,6 +3895,9 @@ def tick_mario(scene, depsgraph=None, _session=None):
 
     session = _session or _lifecycle
     if not _session_is_registered_owner(session) or not session.mario_created:
+        return 0
+    _poll_audio_runtime(session)
+    if session.control_state == POISONED:
         return 0
 
     live_object = get_live_mario_object()
@@ -1879,8 +3945,30 @@ def tick_mario(scene, depsgraph=None, _session=None):
         mario_inputs.camLookX = look_dir.x
         mario_inputs.camLookZ = -look_dir.y
 
-    session.library.sm64_mario_tick(
-        session.mario_id, ct.byref(mario_inputs), ct.byref(mario_state), ct.byref(mario_geo)
+    # Upstream derives platform linear/angular velocity from consecutive move
+    # calls and applies that displacement during Mario tick. Keep this order
+    # deterministic so recording observes the same completed tick and geometry.
+    _update_moving_platforms(session)
+    _native_call(
+        session,
+        "sm64_mario_tick",
+        session.mario_id,
+        ct.byref(mario_inputs),
+        ct.byref(mario_state),
+        ct.byref(mario_geo),
+    )
+    runtime_metadata = MarioRuntimeMetadata(
+        native_position=tuple(float(value) for value in mario_state.position),
+        native_velocity=tuple(float(value) for value in mario_state.velocity),
+        face_angle=float(mario_state.faceAngle),
+        forward_velocity=float(mario_state.forwardVelocity),
+        health=int(mario_state.health),
+        action=int(mario_state.action),
+        animation_id=int(mario_state.animID),
+        animation_frame=int(mario_state.animFrame),
+        flags=int(mario_state.flags),
+        particle_flags=int(mario_state.particleFlags),
+        invincibility_timer=int(mario_state.invincTimer),
     )
     mario_world_location = native_position_to_blender(
         mario_state.position[0], mario_state.position[1], mario_state.position[2]
@@ -1903,8 +3991,10 @@ def tick_mario(scene, depsgraph=None, _session=None):
                     bpy.ops.view3d.view_center_cursor()
 
     live_mesh = _ensure_live_mesh_exclusive(live_object)
-    if tick_count < 15: # This is enough frames to get Mario to open his eyes, then we'll stop updating uv/color
+    if tick_count < 15 or session.force_full_mesh_updates > 0:
         update_mesh_data(live_mesh)
+        if session.force_full_mesh_updates > 0:
+            session.force_full_mesh_updates -= 1
     else:
         update_mesh_data_fast(live_mesh)
 
@@ -1914,6 +4004,7 @@ def tick_mario(scene, depsgraph=None, _session=None):
             tick_count,
             mario_world_location,
             float(mario_state.faceAngle),
+            runtime_metadata,
         )
     except Exception as exc:
         recorder.fail("Recording stopped: {}".format(exc), preserve_samples=True)
@@ -1947,7 +4038,9 @@ def get_surface_array_from_scene():
     scene = bpy.context.window.scene
     objects = [
         obj for obj in cast(List[bpy.types.Object], scene.collection.all_objects)
-        if isinstance(obj.data, bpy.types.Mesh) and not obj.get('libsm64_is_bake', False)
+        if isinstance(obj.data, bpy.types.Mesh)
+        and not obj.get('libsm64_is_bake', False)
+        and collision_role(obj) == COLLISION_ROLE_STATIC
     ]
     triangle_count = 0
     for obj in objects:

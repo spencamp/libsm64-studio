@@ -21,7 +21,7 @@ from libsm64_studio import mario
 
 if installed_test:
     assert expected_root in Path(addon.__file__).resolve().parents
-    assert addon.BUILD_ID == "2.7.0+surface-streaming-fd118132"
+    assert addon.BUILD_ID == "3.0.0+modern-runtime-fd118132"
 
 
 class NativeCall:
