@@ -17,7 +17,7 @@ REQUIRED_MARIO_API = {
     "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
     "apply_scene_debug_settings", "damage_mario", "heal_mario", "kill_mario",
     "probe_collision_at_cursor", "set_mario_health",
-    "set_mario_invincibility", "studio_diagnostics",
+    "set_mario_invincibility", "studio_diagnostics", "clear_mario_cap",
 }
 PINNED_LIBSM64_COMMIT = "fd11813208272b4271d92bd92feb8f3fdbe61be5"
 NATIVE_FILES = {"libsm64-build.json", "sm64.dll", "libsm64.so"}

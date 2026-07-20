@@ -22,6 +22,7 @@ REQUIRED_MARIO_API = (
     "freeze_mario_recording_for_bake", "resume_live_idle_after_transition",
     "damage_mario", "heal_mario", "kill_mario", "probe_collision_at_cursor",
     "set_mario_health", "set_mario_invincibility", "studio_diagnostics",
+    "clear_mario_cap",
 )
 
 
@@ -62,7 +63,7 @@ if configured_install:
     addon = importlib.import_module("libsm64_studio")
     mario = importlib.import_module("libsm64_studio.mario")
     assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-    assert mario.RUNTIME_API_VERSION == 8
+    assert mario.RUNTIME_API_VERSION == 9
     assert_init_import_contract(expected_package)
     assert addon.BAKING == mario.BAKING
     assert addon.POISONED == mario.POISONED
@@ -105,7 +106,7 @@ else:
             addon = importlib.reload(addon)
             mario = importlib.import_module("libsm64_studio.mario")
             assert all(hasattr(mario, symbol) for symbol in REQUIRED_MARIO_API)
-            assert mario.RUNTIME_API_VERSION == 8
+            assert mario.RUNTIME_API_VERSION == 9
             assert addon.BAKING == mario.BAKING
             assert addon.POISONED == mario.POISONED
 

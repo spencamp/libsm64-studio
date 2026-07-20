@@ -242,6 +242,7 @@ try {
         Invoke-BlenderTest "moving-platform regression" (Join-Path $repoRoot "tests\blender_moving_platform_test.py")
         Invoke-BlenderTest "water/gas environment regression" (Join-Path $repoRoot "tests\blender_environment_levels_test.py")
         Invoke-BlenderTest "cap-controls regression" (Join-Path $repoRoot "tests\blender_cap_controls_test.py")
+        Invoke-BlenderTest "Performance Studio panel layout" (Join-Path $repoRoot "tests\blender_performance_studio_panel_test.py")
         Invoke-BlenderTest "runtime-metadata regression" (Join-Path $repoRoot "tests\blender_runtime_metadata_test.py")
         Invoke-BlenderTest "live-audio regression" (Join-Path $repoRoot "tests\blender_audio_test.py")
         Invoke-BlenderTest "directing/debugging regression" (Join-Path $repoRoot "tests\blender_directing_debug_test.py")

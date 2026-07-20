@@ -44,6 +44,13 @@ class CapCall(NativeCall):
         return result
 
 
+class StateCall(NativeCall):
+    def __call__(self, mario_id, flags):
+        result = super().__call__(mario_id, flags)
+        self.library.current_cap = int(flags) & mario.MARIO_SPECIAL_CAP_MASK
+        return result
+
+
 class TickCall(NativeCall):
     def __call__(self, mario_id, _inputs, state_pointer, geometry_pointer):
         result = super().__call__(mario_id, _inputs, state_pointer, geometry_pointer)
@@ -94,7 +101,7 @@ class FakeLibrary:
         self.sm64_set_mario_action = NativeCall(self, "action_set")
         self.sm64_set_mario_animation = NativeCall(self, "animation")
         self.sm64_set_mario_anim_frame = NativeCall(self, "anim_frame")
-        self.sm64_set_mario_state = NativeCall(self, "flags")
+        self.sm64_set_mario_state = StateCall(self, "flags")
         self.sm64_set_mario_position = NativeCall(self, "position")
         self.sm64_set_mario_velocity = NativeCall(self, "velocity")
         self.sm64_set_mario_forward_velocity = NativeCall(self, "forward_velocity")
@@ -200,6 +207,17 @@ try:
     mario.grant_mario_cap(mario.MARIO_VANISH_CAP, 120)
     assert library.sm64_mario_interact_cap.calls[-1] == (17, 0x2, 120, 0)
     assert len(library.sm64_mario_create.calls) == 1
+
+    # No Cap clears only the special-cap bits through the existing live-state
+    # setter. The cached UI diagnostic and the next native tick agree.
+    mario.tick_mario(scene, _session=session)
+    assert int(mario.mario_state.flags) == mario.MARIO_VANISH_CAP | 0x10
+    assert mario.clear_mario_cap() == 0
+    assert library.sm64_set_mario_state.calls[-1] == (17, 0x10)
+    assert mario.cap_diagnostics()["active_flags"] == 0
+    mario.tick_mario(scene, _session=session)
+    assert not int(mario.mario_state.flags) & mario.MARIO_SPECIAL_CAP_MASK
+    assert mario.cap_diagnostics()["history"][-1].operation == "clear"
 
     # Extension requires a meaningful positive tick count.
     assert mario.extend_mario_cap(45) == 45

@@ -74,6 +74,7 @@ MARIO_VANISH_CAP = 0x00000002
 MARIO_METAL_CAP = 0x00000004
 MARIO_WING_CAP = 0x00000008
 SUPPORTED_CAP_FLAGS = (MARIO_WING_CAP, MARIO_METAL_CAP, MARIO_VANISH_CAP)
+MARIO_SPECIAL_CAP_MASK = MARIO_WING_CAP | MARIO_METAL_CAP | MARIO_VANISH_CAP
 CAP_REQUEST_HISTORY_LIMIT = 32
 AUDIO_SOUND_EVENT_HISTORY_LIMIT = 256
 NATIVE_DEBUG_LOG_LIMIT = 256
@@ -105,7 +106,7 @@ original_fps_setting = 0
 original_fps_base = 1.0
 original_cursor_pos = [0.0, 0.0, 0.0]
 simulation_scene = None
-RUNTIME_API_VERSION = 8
+RUNTIME_API_VERSION = 9
 
 SM64SurfaceVertex = ct.c_int32 * 3
 SM64SurfaceVertices = SM64SurfaceVertex * 3
@@ -279,13 +280,15 @@ class MarioCapRequest:
     simulation_tick: int
 
     def __post_init__(self):
-        if self.operation not in ("grant", "extend"):
+        if self.operation not in ("grant", "extend", "clear"):
             raise ValueError("Unknown cap request operation: {}".format(self.operation))
         if self.operation == "grant" and self.cap_flag not in SUPPORTED_CAP_FLAGS:
             raise ValueError("Unsupported cap flag: 0x{:08X}".format(self.cap_flag))
-        if self.operation == "extend" and self.cap_flag != 0:
-            raise ValueError("Cap extension history must use cap flag 0")
-        minimum = 0 if self.operation == "grant" else 1
+        if self.operation in ("extend", "clear") and self.cap_flag != 0:
+            raise ValueError("Cap {} history must use cap flag 0".format(self.operation))
+        if self.operation == "clear" and self.duration_ticks != 0:
+            raise ValueError("Cap clear history must use duration 0")
+        minimum = 1 if self.operation == "extend" else 0
         _require_integer_range("duration_ticks", self.duration_ticks, minimum, 0xFFFF)
         if not isinstance(self.play_music, bool):
             raise ValueError("play_music must be a bool")
@@ -1564,6 +1567,38 @@ def extend_mario_cap(duration_ticks):
     return duration_ticks
 
 
+def clear_mario_cap():
+    """Clear every supported special-cap flag on the owned Live Mario."""
+    session = require_owned_mario_operation(
+        allowed_states=(LIVE_IDLE, RECORDING)
+    )
+    cleared_flags = int(mario_state.flags) & ~MARIO_SPECIAL_CAP_MASK
+    try:
+        _native_call(
+            session,
+            "sm64_set_mario_state",
+            int(session.mario_id), cleared_flags,
+        )
+    except Exception as exc:
+        _poison_session(
+            session,
+            "Native cap clear failed; use End Studio Session and restart "
+            "Blender: {}".format(exc),
+        )
+        session.last_cap_error = session.last_error
+        raise MarioLifecycleError(session.last_error) from exc
+    mario_state.flags = cleared_flags
+    session.force_full_mesh_updates = max(session.force_full_mesh_updates, 2)
+    session.optional_api_features.add("cap_controls")
+    _record_cap_request(
+        session,
+        MarioCapRequest(
+            "clear", 0, 0, False, max(0, int(tick_count))
+        ),
+    )
+    return 0
+
+
 def cap_diagnostics():
     session = _lifecycle
     audio_state = session.audio_runtime.snapshot()
@@ -1571,6 +1606,7 @@ def cap_diagnostics():
         "supported_flags": SUPPORTED_CAP_FLAGS,
         "history": tuple(session.cap_request_history),
         "last_error": session.last_cap_error,
+        "active_flags": int(mario_state.flags) & MARIO_SPECIAL_CAP_MASK,
         "music_enabled": bool(
             audio_state["audio_worker_started"]
             and audio_state["audio_device_opened"]

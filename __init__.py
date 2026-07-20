@@ -11,12 +11,12 @@ _MARIO_REQUIRED_API = (
     "set_persistent_start_mark", "apply_scene_debug_settings", "damage_mario",
     "heal_mario", "kill_mario",
     "probe_collision_at_cursor", "set_mario_health",
-    "set_mario_invincibility", "studio_diagnostics",
+    "set_mario_invincibility", "studio_diagnostics", "clear_mario_cap",
 )
 _RECORDING_REQUIRED_API = (
     "SAMPLE_FPS", "scene_rate_matches_sample_rate", "timeline_playback",
 )
-_RUNTIME_API_VERSION = 8
+_RUNTIME_API_VERSION = 9
 
 
 def _reload_stale_runtime_modules():
@@ -121,6 +121,7 @@ from . mario import (
     audio_diagnostics,
     begin_mario_recording,
     cap_diagnostics,
+    clear_mario_cap,
     clear_persistent_start_mark,
     collision_diagnostics,
     collision_status_message,
@@ -159,7 +160,6 @@ from . recording import (
     bake_shape_keys,
     discard_baked_take,
     recorder,
-    runtime_metadata_at_frame,
     sample_target_frame,
     scene_rate_matches_sample_rate,
     timeline_playback,
@@ -584,58 +584,7 @@ class Main_PT_Panel(bpy.types.Panel):
         end_row.operator(EndMarioControl_OT_Operator.bl_idname, text="End Studio Session")
 
         layout.separator()
-        environment = layout.box()
-        environment.label(text="Environment")
-        water_row = environment.row(align=True)
-        water_row.prop(settings, "enable_water")
-        water_height = water_row.row(align=True)
-        water_height.enabled = settings.enable_water
-        water_height.prop(settings, "water_height", text="Height")
-        gas_row = environment.row(align=True)
-        gas_row.prop(settings, "enable_poison_gas")
-        gas_height = gas_row.row(align=True)
-        gas_height.enabled = settings.enable_poison_gas
-        gas_height.prop(settings, "gas_height", text="Height")
-        if has_owned_native_session():
-            level_diagnostics = environment_diagnostics()
-            water_level = level_diagnostics["levels"][ENVIRONMENT_WATER]
-            gas_level = level_diagnostics["levels"][ENVIRONMENT_GAS]
-            environment.label(
-                text="Native levels: water {} / gas {}".format(
-                    water_level["native_level"], gas_level["native_level"]
-                ),
-                icon='WORLD_DATA',
-            )
-            if level_diagnostics["last_error"]:
-                environment.label(
-                    text=level_diagnostics["last_error"], icon='ERROR'
-                )
-        environment.separator()
-        environment.label(text="Moving Platforms")
-        active_object = getattr(context, "active_object", None)
-        if active_object is not None and getattr(active_object, "type", None) == 'MESH':
-            role_row = environment.row()
-            role_row.enabled = not has_owned_native_session()
-            role_row.prop(active_object, "libsm64_collision_role", text="Selected Mesh")
-            if has_owned_native_session():
-                environment.label(
-                    text="End the Studio Session to change collision roles",
-                    icon='INFO',
-                )
-        else:
-            environment.label(text="Select a mesh to set its collision role", icon='INFO')
-        if has_owned_native_session():
-            diagnostics = collision_diagnostics()
-            environment.label(
-                text="Active: {} platform(s) / {:,} surfaces".format(
-                    diagnostics["moving_platforms"],
-                    diagnostics["moving_platform_surfaces"],
-                )
-            )
-            if diagnostics["last_platform_error"]:
-                environment.label(
-                    text=diagnostics["last_platform_error"], icon='ERROR'
-                )
+        _draw_take_sections(layout, scene, settings)
 
         layout.separator()
         performance = layout.box()
@@ -645,260 +594,219 @@ class Main_PT_Panel(bpy.types.Panel):
         cap_controls.enabled = control_status in (LIVE_IDLE, RECORDING)
         cap_controls.prop(settings, "cap_duration_ticks")
         cap_controls.label(text="30 ticks = 1 second; 0 uses cap default", icon='INFO')
+        cap_status = cap_diagnostics()
+        active_cap_flags = cap_status["active_flags"]
         cap_row = cap_controls.row(align=True)
-        wing = cap_row.operator(GrantCap_OT_Operator.bl_idname, text="Wing")
+        wing = cap_row.operator(
+            GrantCap_OT_Operator.bl_idname,
+            text="Wing",
+            depress=active_cap_flags == MARIO_WING_CAP,
+        )
         wing.cap_flag = MARIO_WING_CAP
-        metal = cap_row.operator(GrantCap_OT_Operator.bl_idname, text="Metal")
+        metal = cap_row.operator(
+            GrantCap_OT_Operator.bl_idname,
+            text="Metal",
+            depress=active_cap_flags == MARIO_METAL_CAP,
+        )
         metal.cap_flag = MARIO_METAL_CAP
-        vanish = cap_row.operator(GrantCap_OT_Operator.bl_idname, text="Vanish")
+        vanish = cap_row.operator(
+            GrantCap_OT_Operator.bl_idname,
+            text="Vanish",
+            depress=active_cap_flags == MARIO_VANISH_CAP,
+        )
         vanish.cap_flag = MARIO_VANISH_CAP
+        cap_row.operator(
+            ClearCap_OT_Operator.bl_idname,
+            text="No Cap",
+            depress=active_cap_flags == 0,
+        )
         extend_row = cap_controls.row()
         extend_row.enabled = settings.cap_duration_ticks > 0
         extend_row.operator(
             ExtendCap_OT_Operator.bl_idname, text="Extend Current Cap"
         )
-        cap_status = cap_diagnostics()
         if cap_status["history"]:
             latest = cap_status["history"][-1]
-            performance.label(
-                text="Last: {} / {} ticks".format(
-                    latest.operation.title(), latest.duration_ticks
-                ),
-                icon='CHECKMARK',
-            )
+            if latest.operation == "clear":
+                performance.label(text="Last: No Cap", icon='CHECKMARK')
+            else:
+                performance.label(
+                    text="Last: {} / {} ticks".format(
+                        latest.operation.title(), latest.duration_ticks
+                    ),
+                    icon='CHECKMARK',
+                )
         if cap_status["last_error"]:
             performance.label(text=cap_status["last_error"], icon='ERROR')
-        performance.label(text="Cap removal is not exposed", icon='INFO')
-        performance.separator()
-        performance.label(text="Health / Damage")
-        directing = performance.column()
-        directing.enabled = control_status in (LIVE_IDLE, RECORDING)
-        health_row = directing.row(align=True)
-        health_row.prop(settings, "directing_health")
-        health_row.operator(SetMarioHealth_OT_Operator.bl_idname, text="Set")
-        heal_row = directing.row(align=True)
-        heal_row.prop(settings, "directing_heal_counter")
-        heal_row.operator(HealMario_OT_Operator.bl_idname, text="Heal")
-        damage_row = directing.row(align=True)
-        damage_row.prop(settings, "directing_damage")
-        damage_row.operator(
-            DamageMario_OT_Operator.bl_idname, text="Damage from Cursor"
-        )
-        directing.prop(settings, "directing_damage_subtype")
-        invincibility_row = directing.row(align=True)
-        invincibility_row.prop(settings, "directing_invincibility_ticks")
-        invincibility_row.operator(
-            SetMarioInvincibility_OT_Operator.bl_idname, text="Set"
-        )
-        directing.operator(KillMario_OT_Operator.bl_idname, text="Kill Mario")
 
         layout.separator()
-        audio_box = layout.box()
-        audio_box.label(text="Audio")
-        audio_box.prop(settings, "enable_live_audio")
-        output = audio_box.column()
-        output.enabled = settings.enable_live_audio
-        output.prop(settings, "audio_volume")
-        output.prop(settings, "audio_mute")
-        music = output.row()
-        audio_state = audio_diagnostics()
-        music.enabled = bool(
-            audio_state["audio_worker_started"]
-            and audio_state["audio_device_opened"]
-        )
-        music.prop(settings, "cap_music")
-        if audio_state["audio_worker_started"]:
-            audio_box.label(
-                text="32 kHz stereo / {:,} generated frames".format(
-                    audio_state["generated_frames"]
-                ),
-                icon='SPEAKER',
-            )
-            audio_box.label(
-                text="Queued: {:,} / underruns: {:,}".format(
-                    audio_state["last_queued_samples"], audio_state["underruns"]
+        _draw_environment_section(layout, context, settings)
+
+
+def _format_timing_frame(frame):
+    return str(int(frame)) if float(frame).is_integer() else "{:.3f}".format(frame)
+
+
+def _take_timing(obj):
+    try:
+        sample_count = int(obj.get("libsm64_sample_count"))
+        sample_fps = float(obj.get("libsm64_sample_fps"))
+        target_fps = float(obj.get("libsm64_target_fps"))
+        start_frame = float(obj.get("libsm64_recording_start_frame"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        sample_count <= 0
+        or not math.isfinite(sample_fps) or sample_fps <= 0.0
+        or not math.isfinite(target_fps) or target_fps <= 0.0
+        or not math.isfinite(start_frame)
+    ):
+        return None
+    end_frame = sample_target_frame(
+        start_frame, sample_count - 1, target_fps, sample_fps
+    )
+    return sample_count / sample_fps, start_frame, end_frame
+
+
+def _draw_timing(layout, timing):
+    duration, start_frame, end_frame = timing
+    layout.label(text="Duration: {:.2f} seconds".format(duration))
+    layout.label(text="Start Frame: {}".format(_format_timing_frame(start_frame)))
+    layout.label(text="End Frame: {}".format(_format_timing_frame(end_frame)))
+
+
+def _draw_take_sections(layout, scene, settings):
+    takes = iter_takes()
+    current = current_take(scene)
+
+    layout.label(text="Active Take")
+    if recorder.active:
+        layout.label(text="Recording in progress", icon='REC')
+        layout.label(text="Duration: {:.2f} seconds".format(recorder.duration_seconds))
+        if math.isfinite(float(recorder.start_frame)):
+            layout.label(
+                text="Start Frame: {}".format(
+                    _format_timing_frame(recorder.start_frame)
                 )
             )
-        elif audio_state["audio_failure"]:
-            audio_box.label(text=audio_state["audio_failure"], icon='ERROR')
+        if recorder.sample_count > 0 and recorder.target_fps > 0:
+            end_frame = sample_target_frame(
+                recorder.start_frame,
+                recorder.sample_count - 1,
+                recorder.target_fps,
+            )
+            layout.label(
+                text="End Frame: {}".format(_format_timing_frame(end_frame))
+            )
+    elif current is None:
+        layout.label(text="No active take")
+    else:
+        draw_take_row(layout, current, is_current=True)
+        timing = _take_timing(current)
+        if timing is None:
+            layout.label(text="Take timing unavailable", icon='INFO')
         else:
-            audio_box.label(
-                text="Optional; Windows packaged backend validated", icon='INFO'
-            )
+            _draw_timing(layout.box(), timing)
 
-        layout.separator()
-        diagnostics_box = layout.box()
-        diagnostics_box.label(text="Diagnostics")
-        diagnostics_box.prop(settings, "enable_native_debug_messages")
-        probe_row = diagnostics_box.row()
-        probe_row.enabled = control_status in (LIVE_IDLE, RECORDING)
-        probe_row.operator(
-            ProbeCollision_OT_Operator.bl_idname,
-            text="Probe Collision at 3D Cursor",
-            icon='PIVOT_CURSOR',
-        )
-        diagnostics_state = studio_diagnostics()
-        mario_snapshot = diagnostics_state["mario_state"]
-        if mario_snapshot is not None:
-            diagnostics_box.label(
-                text="Mario {} / health {} / action 0x{:08X}".format(
-                    mario_snapshot["mario_id"], mario_snapshot["health"],
-                    mario_snapshot["action"],
-                )
-            )
-        diagnostics_box.label(
-            text="Debug callback: {} / {} message(s)".format(
-                "active" if diagnostics_state["debug_callback_registered"] else "inactive",
-                len(diagnostics_state["debug_log"]),
-            )
-        )
-        if diagnostics_state["last_debug_error"]:
-            diagnostics_box.label(
-                text=diagnostics_state["last_debug_error"], icon='ERROR'
-            )
-        query = diagnostics_state["last_collision_query"]
-        if query is not None:
-            diagnostics_box.label(
-                text="Cursor: {:.3f}, {:.3f}, {:.3f}".format(
-                    *query.blender_position
-                )
-            )
-            diagnostics_box.label(
-                text="Native: {:.1f}, {:.1f}, {:.1f}".format(
-                    *query.native_position
-                )
-            )
-            floor_label = (
-                "No floor" if query.no_floor
-                else "{:.3f}".format(query.floor_blender_height)
-            )
-            water_label = (
-                "None" if query.water_blender_height is None
-                else "{:.3f}".format(query.water_blender_height)
-            )
-            gas_label = (
-                "None" if query.gas_blender_height is None
-                else "{:.3f}".format(query.gas_blender_height)
-            )
-            diagnostics_box.label(
-                text="Floor {} / water {} / gas {}".format(
-                    floor_label, water_label, gas_label
-                )
-            )
-            diagnostics_box.label(
-                text="Chunk {} {} / nearby surfaces {:,}".format(
-                    query.chunk_key,
-                    "active" if query.chunk_active else "inactive",
-                    query.nearby_static_surface_count,
-                )
-            )
-        operation = diagnostics_state["last_directing_operation"]
-        if operation is not None:
-            diagnostics_box.label(
-                text="Last directing operation: {}".format(
-                    operation["operation"].replace("_", " ").title()
-                )
-            )
-        if diagnostics_state["last_directing_error"]:
-            diagnostics_box.label(
-                text=diagnostics_state["last_directing_error"], icon='ERROR'
-            )
-        for record in diagnostics_state["debug_log"][-3:]:
-            diagnostics_box.label(text=record.text or "(empty native message)")
+    favorites = sorted(
+        (obj for obj in takes if obj.get(TAKE_DISPOSITION) == FAVORITE),
+        key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+    )
+    layout.separator()
+    layout.label(text="Favorite Takes")
+    if favorites:
+        for obj in favorites:
+            draw_take_row(layout, obj, is_current=(obj is current))
+    else:
+        layout.label(text="No favorites")
 
-        takes = iter_takes()
-        current = current_take(scene)
+    regular = sorted(
+        (obj for obj in takes
+         if obj.get(TAKE_DISPOSITION) == REGULAR and obj is not current),
+        key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+    )
+    layout.separator()
+    layout.label(text="Other Takes")
+    if regular:
+        for obj in regular:
+            draw_take_row(layout, obj)
+    else:
+        layout.label(text="No other takes")
 
-        layout.separator()
-        layout.label(text="Active Take")
-        if current is None:
-            layout.label(text="No active take")
-        else:
-            draw_take_row(layout, current, is_current=True)
-            metadata_box = layout.box()
-            metadata_box.label(text="Runtime Metadata")
-            metadata_error = False
-            try:
-                frame = float(getattr(scene, "frame_current_final", scene.frame_current))
-                metadata_result = runtime_metadata_at_frame(current, frame)
-            except RecordingError as exc:
-                metadata_box.label(text=str(exc), icon='ERROR')
-                metadata_result = None
-                metadata_error = True
-            if metadata_result is None and not metadata_error:
-                metadata_box.label(text="Legacy take: no runtime metadata", icon='INFO')
-            elif metadata_result is not None:
-                sample_index, metadata, validated = metadata_result
-                metadata_box.label(
-                    text="Held sample {:,} / {:,}".format(
-                        sample_index + 1, len(validated["samples"])
-                    )
-                )
-                metadata_box.label(text="Action: 0x{:08X}".format(metadata.action))
-                metadata_box.label(
-                    text="Animation: {} / {}".format(
-                        metadata.animation_id, metadata.animation_frame
-                    )
-                )
-                metadata_box.label(
-                    text="Velocity: {:.3f}, {:.3f}, {:.3f}".format(
-                        *metadata.native_velocity
-                    )
-                )
-                metadata_box.label(
-                    text="Forward velocity: {:.3f}".format(metadata.forward_velocity)
-                )
-                metadata_box.label(text="Health: {}".format(metadata.health))
-                metadata_box.label(text="Flags: 0x{:08X}".format(metadata.flags))
-                metadata_box.label(
-                    text="Particles: 0x{:08X}".format(metadata.particle_flags)
-                )
-                metadata_box.label(
-                    text="Invincibility: {}".format(metadata.invincibility_timer)
-                )
+    rejected = sorted(
+        (obj for obj in takes if obj.get(TAKE_DISPOSITION) == REJECTED),
+        key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+    )
+    layout.separator()
+    row = layout.row()
+    icon = 'TRIA_DOWN' if settings.rejected_expanded else 'TRIA_RIGHT'
+    row.prop(
+        settings, "rejected_expanded",
+        text="Rejected Takes ({})".format(len(rejected)), icon=icon, emboss=False,
+    )
+    if settings.rejected_expanded:
+        for obj in rejected:
+            rejected_row = layout.row(align=True)
+            rejected_row.label(text=take_label(obj))
+            op = rejected_row.operator(
+                RestoreTake_OT_Operator.bl_idname, text="Restore"
+            )
+            op.take_id = obj[TAKE_ID]
 
-        favorites = sorted(
-            (obj for obj in takes if obj.get(TAKE_DISPOSITION) == FAVORITE),
-            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
-        )
-        layout.separator()
-        layout.label(text="Favorite Takes")
-        if favorites:
-            for obj in favorites:
-                draw_take_row(layout, obj, is_current=(obj is current))
-        else:
-            layout.label(text="No favorites")
 
-        regular = sorted(
-            (obj for obj in takes
-             if obj.get(TAKE_DISPOSITION) == REGULAR and obj is not current),
-            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+def _draw_environment_section(layout, context, settings):
+    environment = layout.box()
+    environment.label(text="Environment")
+    water_row = environment.row(align=True)
+    water_row.prop(settings, "enable_water")
+    water_height = water_row.row(align=True)
+    water_height.enabled = settings.enable_water
+    water_height.prop(settings, "water_height", text="Height")
+    gas_row = environment.row(align=True)
+    gas_row.prop(settings, "enable_poison_gas")
+    gas_height = gas_row.row(align=True)
+    gas_height.enabled = settings.enable_poison_gas
+    gas_height.prop(settings, "gas_height", text="Height")
+    if has_owned_native_session():
+        level_diagnostics = environment_diagnostics()
+        water_level = level_diagnostics["levels"][ENVIRONMENT_WATER]
+        gas_level = level_diagnostics["levels"][ENVIRONMENT_GAS]
+        environment.label(
+            text="Native levels: water {} / gas {}".format(
+                water_level["native_level"], gas_level["native_level"]
+            ),
+            icon='WORLD_DATA',
         )
-        layout.separator()
-        layout.label(text="Other Takes")
-        if regular:
-            for obj in regular:
-                draw_take_row(layout, obj)
-        else:
-            layout.label(text="No other takes")
-
-        rejected = sorted(
-            (obj for obj in takes if obj.get(TAKE_DISPOSITION) == REJECTED),
-            key=lambda obj: int(obj.get("libsm64_take_number", 0)), reverse=True,
+        if level_diagnostics["last_error"]:
+            environment.label(text=level_diagnostics["last_error"], icon='ERROR')
+    environment.separator()
+    environment.label(text="Moving Platforms")
+    active_object = getattr(context, "active_object", None)
+    if active_object is not None and getattr(active_object, "type", None) == 'MESH':
+        role_row = environment.row()
+        role_row.enabled = not has_owned_native_session()
+        role_row.prop(active_object, "libsm64_collision_role", text="Selected Mesh")
+        if has_owned_native_session():
+            environment.label(
+                text="End the Studio Session to change collision roles",
+                icon='INFO',
+            )
+    else:
+        environment.label(
+            text="Select a mesh to set its collision role", icon='INFO'
         )
-        layout.separator()
-        row = layout.row()
-        icon = 'TRIA_DOWN' if settings.rejected_expanded else 'TRIA_RIGHT'
-        row.prop(
-            settings, "rejected_expanded",
-            text="Rejected Takes ({})".format(len(rejected)), icon=icon, emboss=False,
+    if has_owned_native_session():
+        diagnostics = collision_diagnostics()
+        environment.label(
+            text="Active: {} platform(s) / {:,} surfaces".format(
+                diagnostics["moving_platforms"],
+                diagnostics["moving_platform_surfaces"],
+            )
         )
-        if settings.rejected_expanded:
-            for obj in rejected:
-                rejected_row = layout.row(align=True)
-                rejected_row.label(text=take_label(obj))
-                op = rejected_row.operator(RestoreTake_OT_Operator.bl_idname, text="Restore")
-                op.take_id = obj[TAKE_ID]
+        if diagnostics["last_platform_error"]:
+            environment.label(
+                text=diagnostics["last_platform_error"], icon='ERROR'
+            )
 
 
 def draw_take_row(layout, obj, is_current=False):
@@ -1184,6 +1092,25 @@ class GrantCap_OT_Operator(bpy.types.Operator):
             return {'CANCELLED'}
         label = names.get(int(self.cap_flag), "Cap")
         self.report({'INFO'}, "{} Cap granted".format(label))
+        return {'FINISHED'}
+
+
+class ClearCap_OT_Operator(bpy.types.Operator):
+    bl_idname = "view3d.libsm64_clear_cap"
+    bl_label = "No Cap"
+    bl_description = "Clear Wing, Metal, and Vanish Cap from Live Mario"
+
+    @classmethod
+    def poll(cls, context):
+        return live_control_status() in (LIVE_IDLE, RECORDING)
+
+    def execute(self, context):
+        try:
+            clear_mario_cap()
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Special cap cleared")
         return {'FINISHED'}
 
 
@@ -1557,6 +1484,7 @@ register_classes, unregister_classes = bpy.utils.register_classes_factory((
     SetStartMark_OT_Operator,
     ResetToStartMark_OT_Operator,
     GrantCap_OT_Operator,
+    ClearCap_OT_Operator,
     ExtendCap_OT_Operator,
     SetMarioHealth_OT_Operator,
     HealMario_OT_Operator,
